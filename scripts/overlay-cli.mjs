@@ -1778,7 +1778,43 @@ async function performCodeReview(input) {
       return { type: 'code-review', error: `Failed to fetch PR diff: ${e.message}` };
     }
 
-    return analyzePrReview(prInfo, prDiff);
+    const review = analyzePrReview(prInfo, prDiff);
+
+    // Post the review as a comment on the GitHub PR
+    try {
+      const { execSync: exec2 } = await import('child_process');
+      const findingsText = review.findings.length > 0
+        ? review.findings.map(f => `- **${f.severity}** \`${f.file}\`: ${f.detail}`).join('\n')
+        : '_No issues found._';
+
+      const commentBody = [
+        `## 🦉 Automated Code Review`,
+        ``,
+        `**Summary:** ${review.summary}`,
+        `**Files reviewed:** ${review.filesReviewed} | **Lines changed:** ${review.linesChanged}`,
+        ``,
+        `### Findings (${review.findings.length})`,
+        findingsText,
+        ``,
+        `### Overall Assessment`,
+        review.overallAssessment,
+        ``,
+        `---`,
+        `_Review performed by [BSV Overlay Skill](https://github.com/galt-tr/bsv-overlay-skill) • Paid via BSV micropayment_`,
+      ].join('\n');
+
+      // Post as a PR review comment (not approval — let humans decide)
+      exec2(
+        `gh pr comment ${prNumber} --repo ${owner}/${repo} --body ${JSON.stringify(commentBody)}`,
+        { encoding: 'utf-8', timeout: 15000 },
+      );
+      review.githubCommentPosted = true;
+    } catch (e) {
+      review.githubCommentPosted = false;
+      review.githubCommentError = e instanceof Error ? e.message : String(e);
+    }
+
+    return review;
   } else if (input.code) {
     return analyzeCodeSnippet(input.code, input.language || 'unknown');
   }
