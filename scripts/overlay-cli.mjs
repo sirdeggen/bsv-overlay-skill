@@ -2060,40 +2060,31 @@ async function processWebResearch(msg, identityKey, privKey) {
     }
   }
 
-  // ── Perform the web research ──
-  let researchResult;
-  try {
-    researchResult = await performWebResearch(query.trim());
-  } catch (e) {
-    researchResult = { error: `Research failed: ${e.message}` };
-  }
-
-  // ── Send response ──
-  const responsePayload = {
+  // ── Queue the research for Clawdbot to handle (uses built-in web_search) ──
+  const queueEntry = {
+    type: 'pending-research',
     requestId: msg.id,
-    serviceId: 'web-research',
-    status: researchResult.error ? 'partial' : 'fulfilled',
-    result: researchResult,
-    paymentAccepted: true,
+    query: query.trim(),
+    from: msg.from,
+    identityKey,
     paymentTxid,
     satoshisReceived: paymentSats,
     walletAccepted,
     ...(acceptError ? { walletError: acceptError } : {}),
+    _ts: Date.now(),
   };
-  const sig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
-  await fetch(`${OVERLAY_URL}/relay/send`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: responsePayload, signature: sig }),
-  });
+  const queuePath = path.join(OVERLAY_STATE_DIR, 'research-queue.jsonl');
+  try {
+    fs.mkdirSync(OVERLAY_STATE_DIR, { recursive: true });
+    fs.appendFileSync(queuePath, JSON.stringify(queueEntry) + '\n');
+  } catch {}
 
   return {
     id: msg.id,
     type: 'service-request',
     serviceId: 'web-research',
-    action: researchResult.error ? 'partial' : 'fulfilled',
+    action: 'queued',
     query: query.slice(0, 80),
-    sourcesCount: researchResult.sources?.length || 0,
     paymentAccepted: true,
     paymentTxid,
     satoshisReceived: paymentSats,
@@ -2108,101 +2099,6 @@ async function processWebResearch(msg, identityKey, privKey) {
  * Perform web research using Brave Search API via fetch.
  * Returns a synthesized answer with sources — no LLM, just structured extraction.
  */
-async function performWebResearch(query) {
-  // Use Brave Search API
-  const BRAVE_API_KEY = process.env.BRAVE_API_KEY || '';
-  let searchResults;
-
-  // Try Brave Search first
-  if (BRAVE_API_KEY) {
-    const searchResp = await fetch(`https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=8`, {
-      headers: { 'Accept': 'application/json', 'X-Subscription-Token': BRAVE_API_KEY },
-    });
-    if (searchResp.ok) {
-      const data = await searchResp.json();
-      searchResults = data.web?.results || [];
-    }
-  }
-
-  // Fallback: DuckDuckGo HTML search (no API key needed)
-  if (!searchResults || searchResults.length === 0) {
-    try {
-      const ddgResp = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ClawdbotAgent/1.0)' },
-      });
-      if (ddgResp.ok) {
-        const html = await ddgResp.text();
-        const results = [];
-        // Extract result links and titles
-        const linkMatches = [...html.matchAll(/<a rel="nofollow" class="result__a" href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g)];
-        // Extract snippets
-        const snippetMatches = [...html.matchAll(/<a class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g)];
-        for (let i = 0; i < linkMatches.length && i < 8; i++) {
-          let url = linkMatches[i][1];
-          // DDG wraps URLs in redirects
-          const uddg = url.match(/uddg=([^&]+)/);
-          if (uddg) url = decodeURIComponent(uddg[1]);
-          const title = linkMatches[i][2].replace(/<[^>]+>/g, '').trim();
-          const snippet = snippetMatches[i] ? snippetMatches[i][1].replace(/<[^>]+>/g, '').trim() : '';
-          results.push({ title, url, description: snippet });
-        }
-        if (results.length > 0) searchResults = results;
-      }
-    } catch {}
-  }
-
-  // Last resort: DuckDuckGo instant answers API
-  if (!searchResults || searchResults.length === 0) {
-    try {
-      const ddgResp = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1`);
-      if (ddgResp.ok) {
-        const ddg = await ddgResp.json();
-        const results = [];
-        if (ddg.Abstract) results.push({ title: ddg.Heading || query, url: ddg.AbstractURL || '', description: ddg.Abstract });
-        if (ddg.RelatedTopics) {
-          for (const topic of ddg.RelatedTopics.slice(0, 6)) {
-            if (topic.Text && topic.FirstURL) results.push({ title: topic.Text.slice(0, 100), url: topic.FirstURL, description: topic.Text });
-          }
-        }
-        if (results.length > 0) searchResults = results;
-      }
-    } catch {}
-  }
-
-  if (!searchResults || searchResults.length === 0) {
-    return { error: 'No search results found. Try a different query.', query };
-  }
-
-  // Synthesize the results into a structured answer
-  const sources = searchResults.slice(0, 8).map((r, i) => ({
-    rank: i + 1,
-    title: r.title || 'Untitled',
-    url: r.url || '',
-    snippet: (r.description || r.snippet || '').slice(0, 300),
-  }));
-
-  // Build a summary from the top snippets
-  const topSnippets = sources.slice(0, 4).map(s => s.snippet).filter(Boolean);
-  const summary = topSnippets.length > 0
-    ? topSnippets.join(' | ').slice(0, 800)
-    : 'Multiple sources found — see details below.';
-
-  // Extract key facts/entities from snippets
-  const allText = sources.map(s => s.snippet).join(' ');
-  const numbers = [...new Set(allText.match(/\$[\d,.]+|\d+%|\d{4}/g) || [])].slice(0, 5);
-  const entities = [...new Set(allText.match(/[A-Z][a-z]+(?:\s[A-Z][a-z]+)+/g) || [])].slice(0, 5);
-
-  return {
-    query,
-    summary,
-    sources,
-    keyFacts: numbers.length > 0 ? numbers : undefined,
-    keyEntities: entities.length > 0 ? entities : undefined,
-    resultCount: sources.length,
-    timestamp: new Date().toISOString(),
-  };
-}
-
 /** Analyze a GitHub PR diff for common issues. */
 function analyzePrReview(prInfo, diff) {
   const files = prInfo.files || [];
@@ -2772,6 +2668,80 @@ async function cmdConnect() {
   await new Promise(() => {});
 }
 
+// ---------------------------------------------------------------------------
+// research-queue / research-respond — Clawdbot processes web research via its tools
+// ---------------------------------------------------------------------------
+
+async function cmdResearchQueue() {
+  const queuePath = path.join(OVERLAY_STATE_DIR, 'research-queue.jsonl');
+  if (!fs.existsSync(queuePath)) return ok({ pending: [] });
+  const lines = fs.readFileSync(queuePath, 'utf-8').trim().split('\n').filter(Boolean);
+  const entries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  ok({ pending: entries, count: entries.length });
+}
+
+async function cmdResearchRespond(resultJsonPath) {
+  if (!resultJsonPath) return fail('Usage: research-respond <resultJsonFile>');
+  if (!fs.existsSync(resultJsonPath)) return fail(`File not found: ${resultJsonPath}`);
+
+  const result = JSON.parse(fs.readFileSync(resultJsonPath, 'utf-8'));
+  const { requestId, from: recipientKey, query, research } = result;
+
+  if (!requestId || !recipientKey || !research) {
+    return fail('Result JSON must have: requestId, from, query, research');
+  }
+
+  // Load identity
+  const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
+  if (!fs.existsSync(identityPath)) return fail('Wallet not initialized.');
+  const identity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
+  const privKey = PrivateKey.fromHex(identity.rootKeyHex);
+  const identityKey = privKey.toPublicKey().toString();
+  const relayPrivHex = identity.relayKeyHex || identity.rootKeyHex;
+
+  const responsePayload = {
+    requestId,
+    serviceId: 'web-research',
+    status: 'fulfilled',
+    result: research,
+    paymentAccepted: true,
+    paymentTxid: result.paymentTxid || null,
+    satoshisReceived: result.satoshisReceived || 0,
+    walletAccepted: result.walletAccepted ?? true,
+  };
+
+  const sig = signRelayMessage(relayPrivHex, recipientKey, 'service-response', responsePayload);
+  const sendResp = await fetch(`${OVERLAY_URL}/relay/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: identityKey,
+      to: recipientKey,
+      type: 'service-response',
+      payload: responsePayload,
+      signature: sig,
+    }),
+  });
+
+  if (!sendResp.ok) {
+    return fail(`Failed to send response: ${await sendResp.text()}`);
+  }
+
+  const sendResult = await sendResp.json();
+
+  // Remove from queue
+  const queuePath = path.join(OVERLAY_STATE_DIR, 'research-queue.jsonl');
+  if (fs.existsSync(queuePath)) {
+    const lines = fs.readFileSync(queuePath, 'utf-8').trim().split('\n').filter(Boolean);
+    const remaining = lines.filter(l => {
+      try { return JSON.parse(l).requestId !== requestId; } catch { return true; }
+    });
+    fs.writeFileSync(queuePath, remaining.length ? remaining.join('\n') + '\n' : '');
+  }
+
+  ok({ responded: true, requestId, to: recipientKey, query, pushed: sendResult.pushed });
+}
+
 async function cmdRequestService(targetKey, serviceId, satsStr, inputJsonStr) {
   if (!targetKey || !serviceId) {
     return fail('Usage: request-service <identityKey> <serviceId> [sats] [inputJson]');
@@ -2890,9 +2860,11 @@ try {
     case 'poll':              await cmdPoll(); break;
     case 'connect':           await cmdConnect(); break;
     case 'request-service':   await cmdRequestService(args[0], args[1], args[2], args[3]); break;
+    case 'research-respond':  await cmdResearchRespond(args[0]); break;
+    case 'research-queue':    await cmdResearchQueue(); break;
 
     default:
-      fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, services, advertise, remove, discover, pay, verify, accept, send, inbox, ack, poll, connect, request-service`);
+      fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, services, advertise, remove, discover, pay, verify, accept, send, inbox, ack, poll, connect, request-service, research-queue, research-respond`);
   }
 } catch (err) {
   fail(err instanceof Error ? err.message : String(err));
