@@ -29,6 +29,13 @@
  *   pay <identityKey> <sats> [description]             — Pay another agent
  *   verify <beef_base64>                               — Verify incoming payment
  *   accept <beef> <prefix> <suffix> <senderKey> [desc] — Accept payment
+ *
+ * Messaging:
+ *   send <identityKey> <type> <json_payload>           — Send a message via relay
+ *   inbox [--since <ms>]                               — Check inbox for pending messages
+ *   ack <messageId> [messageId2 ...]                   — Mark messages as read
+ *   poll                                               — Process inbox (auto-handle known types)
+ *   request-service <identityKey> <serviceId> [sats]   — Pay + request a service
  */
 
 // Suppress dotenv noise
@@ -95,7 +102,7 @@ try {
 // Restore console.log
 console.log = _origLog;
 
-const { PrivateKey, PublicKey, Hash, Utils, Transaction, Script, P2PKH, Beef, MerklePath } = sdk;
+const { PrivateKey, PublicKey, Hash, Utils, Transaction, Script, P2PKH, Beef, MerklePath, Signature } = sdk;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -1231,6 +1238,372 @@ async function cmdDiscover(args) {
 }
 
 // ---------------------------------------------------------------------------
+// Relay messaging helpers
+// ---------------------------------------------------------------------------
+
+/** Get our identity key and private key from wallet. */
+function loadIdentity() {
+  const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
+  if (!fs.existsSync(identityPath)) {
+    throw new Error('Wallet not initialized. Run: overlay-cli setup');
+  }
+  const identity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
+  const privKey = PrivateKey.fromHex(identity.rootKeyHex);
+  return { identityKey: identity.identityKey, privKey };
+}
+
+/** Sign a relay message: ECDSA over sha256(to + type + JSON.stringify(payload)). */
+function signRelayMessage(privKey, to, type, payload) {
+  const preimage = to + type + JSON.stringify(payload);
+  const msgHash = Hash.sha256(Array.from(new TextEncoder().encode(preimage)));
+  const sig = privKey.sign(msgHash);
+  return Array.from(sig.toDER()).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** Verify a relay message signature. */
+function verifyRelaySignature(fromKey, to, type, payload, signatureHex) {
+  if (!signatureHex) return { valid: false, reason: 'no signature' };
+  try {
+    const preimage = to + type + JSON.stringify(payload);
+    const msgHash = Hash.sha256(Array.from(new TextEncoder().encode(preimage)));
+    const sigBytes = [];
+    for (let i = 0; i < signatureHex.length; i += 2) {
+      sigBytes.push(parseInt(signatureHex.substring(i, i + 2), 16));
+    }
+    const sig = Signature.fromDER(sigBytes);
+    const pubKey = PublicKey.fromString(fromKey);
+    return { valid: pubKey.verify(msgHash, sig) };
+  } catch (err) {
+    return { valid: false, reason: String(err) };
+  }
+}
+
+const JOKES = [
+  { setup: "Why do programmers prefer dark mode?", punchline: "Because light attracts bugs." },
+  { setup: "Why did the BSV go to therapy?", punchline: "It had too many unresolved transactions." },
+  { setup: "How many satoshis does it take to change a lightbulb?", punchline: "None — they prefer to stay on-chain." },
+  { setup: "Why don't AI agents ever get lonely?", punchline: "They're always on the overlay." },
+  { setup: "What did one Clawdbot say to the other?", punchline: "I'd tell you a joke, but it'll cost you 5 sats." },
+  { setup: "Why did the blockchain break up with the database?", punchline: "It needed more commitment." },
+  { setup: "What's a miner's favorite type of music?", punchline: "Block and roll." },
+  { setup: "Why was the transaction so confident?", punchline: "It had six confirmations." },
+  { setup: "What do you call a wallet with no UTXOs?", punchline: "A sad wallet." },
+  { setup: "Why did the smart contract go to school?", punchline: "To improve its execution." },
+  { setup: "How do BSV nodes say goodbye?", punchline: "See you on the next block!" },
+  { setup: "Why don't private keys ever get invited to parties?", punchline: "They're too secretive." },
+  { setup: "What's an overlay node's favorite game?", punchline: "Peer-to-peer tag." },
+  { setup: "Why did the UTXO feel special?", punchline: "Because it was unspent." },
+  { setup: "What did the signature say to the hash?", punchline: "I've got you covered." },
+];
+
+// ---------------------------------------------------------------------------
+// Relay messaging commands
+// ---------------------------------------------------------------------------
+
+async function cmdSend(targetKey, type, payloadStr) {
+  if (!targetKey || !type || !payloadStr) {
+    return fail('Usage: send <identityKey> <type> <json_payload>');
+  }
+  if (!/^0[23][0-9a-fA-F]{64}$/.test(targetKey)) {
+    return fail('Target must be a compressed public key (66 hex chars, 02/03 prefix)');
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(payloadStr);
+  } catch {
+    return fail('payload must be valid JSON');
+  }
+
+  const { identityKey, privKey } = loadIdentity();
+  const signature = signRelayMessage(privKey, targetKey, type, payload);
+
+  const resp = await fetch(`${OVERLAY_URL}/relay/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: identityKey,
+      to: targetKey,
+      type,
+      payload,
+      signature,
+    }),
+  });
+  if (!resp.ok) {
+    const body = await resp.text();
+    return fail(`Relay send failed (${resp.status}): ${body}`);
+  }
+  const result = await resp.json();
+  ok({ sent: true, messageId: result.id, to: targetKey, type, signed: true });
+}
+
+async function cmdInbox(args) {
+  const { identityKey } = loadIdentity();
+  let since = '';
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--since' && args[i + 1]) since = `&since=${args[++i]}`;
+  }
+
+  const resp = await fetch(`${OVERLAY_URL}/relay/inbox?identity=${identityKey}${since}`);
+  if (!resp.ok) {
+    const body = await resp.text();
+    return fail(`Relay inbox failed (${resp.status}): ${body}`);
+  }
+  const result = await resp.json();
+
+  // Verify signatures on received messages
+  const messages = result.messages.map(msg => ({
+    ...msg,
+    signatureValid: msg.signature
+      ? verifyRelaySignature(msg.from, msg.to, msg.type, msg.payload, msg.signature).valid
+      : null,
+  }));
+
+  ok({ messages, count: messages.length, identityKey });
+}
+
+async function cmdAck(messageIds) {
+  if (!messageIds || messageIds.length === 0) {
+    return fail('Usage: ack <messageId> [messageId2 ...]');
+  }
+  const { identityKey } = loadIdentity();
+
+  const resp = await fetch(`${OVERLAY_URL}/relay/ack`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ identity: identityKey, messageIds }),
+  });
+  if (!resp.ok) {
+    const body = await resp.text();
+    return fail(`Relay ack failed (${resp.status}): ${body}`);
+  }
+  const result = await resp.json();
+  ok({ acked: result.acked, messageIds });
+}
+
+async function cmdPoll() {
+  const { identityKey, privKey } = loadIdentity();
+
+  // Fetch inbox
+  const inboxResp = await fetch(`${OVERLAY_URL}/relay/inbox?identity=${identityKey}`);
+  if (!inboxResp.ok) {
+    const body = await inboxResp.text();
+    return fail(`Relay inbox failed (${inboxResp.status}): ${body}`);
+  }
+  const inbox = await inboxResp.json();
+
+  if (inbox.count === 0) {
+    return ok({ processed: 0, messages: [], summary: 'No pending messages.' });
+  }
+
+  const processed = [];
+  const ackedIds = [];
+  const unhandled = [];
+
+  for (const msg of inbox.messages) {
+    // Verify signature if present
+    const sigCheck = msg.signature
+      ? verifyRelaySignature(msg.from, msg.to, msg.type, msg.payload, msg.signature)
+      : { valid: null };
+
+    if (msg.type === 'ping') {
+      // Auto-respond with pong
+      const pongPayload = {
+        text: 'pong',
+        inReplyTo: msg.id,
+        originalText: msg.payload?.text || null,
+      };
+      const pongSig = signRelayMessage(privKey, msg.from, 'pong', pongPayload);
+      await fetch(`${OVERLAY_URL}/relay/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from: identityKey,
+          to: msg.from,
+          type: 'pong',
+          payload: pongPayload,
+          signature: pongSig,
+        }),
+      });
+      ackedIds.push(msg.id);
+      processed.push({ id: msg.id, type: 'ping', action: 'replied-pong', from: msg.from });
+
+    } else if (msg.type === 'service-request') {
+      const serviceId = msg.payload?.serviceId;
+      if (serviceId === 'tell-joke') {
+        // Check that payment data exists (soft check for now)
+        const hasPayment = !!(msg.payload?.payment?.beef);
+
+        // Pick a random joke
+        const joke = JOKES[Math.floor(Math.random() * JOKES.length)];
+
+        // Send response
+        const responsePayload = {
+          requestId: msg.id,
+          serviceId: 'tell-joke',
+          status: 'fulfilled',
+          result: joke,
+          paymentAccepted: hasPayment,
+        };
+        const respSig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
+        await fetch(`${OVERLAY_URL}/relay/send`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            from: identityKey,
+            to: msg.from,
+            type: 'service-response',
+            payload: responsePayload,
+            signature: respSig,
+          }),
+        });
+        ackedIds.push(msg.id);
+        processed.push({
+          id: msg.id,
+          type: 'service-request',
+          serviceId: 'tell-joke',
+          action: 'fulfilled',
+          joke,
+          paymentAccepted: hasPayment,
+          from: msg.from,
+        });
+      } else {
+        // Unknown service — don't auto-process
+        unhandled.push({
+          id: msg.id,
+          type: 'service-request',
+          serviceId,
+          from: msg.from,
+          signatureValid: sigCheck.valid,
+        });
+      }
+
+    } else if (msg.type === 'pong') {
+      // Pong responses — just ack them
+      ackedIds.push(msg.id);
+      processed.push({
+        id: msg.id,
+        type: 'pong',
+        action: 'received',
+        from: msg.from,
+        text: msg.payload?.text,
+        inReplyTo: msg.payload?.inReplyTo,
+      });
+
+    } else if (msg.type === 'service-response') {
+      // Service responses — ack and report
+      ackedIds.push(msg.id);
+      processed.push({
+        id: msg.id,
+        type: 'service-response',
+        action: 'received',
+        from: msg.from,
+        serviceId: msg.payload?.serviceId,
+        status: msg.payload?.status,
+        result: msg.payload?.result,
+        requestId: msg.payload?.requestId,
+      });
+
+    } else {
+      // Unknown type — don't auto-process
+      unhandled.push({
+        id: msg.id,
+        type: msg.type,
+        from: msg.from,
+        payload: msg.payload,
+        signatureValid: sigCheck.valid,
+      });
+    }
+  }
+
+  // ACK processed messages
+  if (ackedIds.length > 0) {
+    await fetch(`${OVERLAY_URL}/relay/ack`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ identity: identityKey, messageIds: ackedIds }),
+    });
+  }
+
+  ok({
+    processed: processed.length,
+    unhandled: unhandled.length,
+    total: inbox.count,
+    messages: processed,
+    unhandledMessages: unhandled,
+    ackedIds,
+  });
+}
+
+async function cmdRequestService(targetKey, serviceId, satsStr) {
+  if (!targetKey || !serviceId) {
+    return fail('Usage: request-service <identityKey> <serviceId> [sats]');
+  }
+  if (!/^0[23][0-9a-fA-F]{64}$/.test(targetKey)) {
+    return fail('Target must be a compressed public key (66 hex chars, 02/03 prefix)');
+  }
+
+  const { identityKey, privKey } = loadIdentity();
+  const sats = parseInt(satsStr || '5', 10);
+
+  // Build the service request payload
+  let paymentData = null;
+
+  if (sats > 0) {
+    try {
+      const payment = await buildDirectPayment(targetKey, sats, `service-request: ${serviceId}`);
+      paymentData = {
+        beef: payment.beef,
+        txid: payment.txid,
+        satoshis: payment.satoshis,
+        derivationPrefix: payment.derivationPrefix,
+        derivationSuffix: payment.derivationSuffix,
+        senderIdentityKey: payment.senderIdentityKey,
+      };
+    } catch (err) {
+      // Payment failed — send request without payment
+      paymentData = { error: String(err instanceof Error ? err.message : err) };
+    }
+  }
+
+  const requestPayload = {
+    serviceId,
+    payment: paymentData,
+    requestedAt: new Date().toISOString(),
+  };
+
+  const signature = signRelayMessage(privKey, targetKey, 'service-request', requestPayload);
+
+  const resp = await fetch(`${OVERLAY_URL}/relay/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: identityKey,
+      to: targetKey,
+      type: 'service-request',
+      payload: requestPayload,
+      signature,
+    }),
+  });
+  if (!resp.ok) {
+    const body = await resp.text();
+    return fail(`Relay send failed (${resp.status}): ${body}`);
+  }
+  const result = await resp.json();
+
+  ok({
+    sent: true,
+    requestId: result.id,
+    to: targetKey,
+    serviceId,
+    paymentIncluded: paymentData && !paymentData.error,
+    paymentTxid: paymentData?.txid || null,
+    satoshis: paymentData?.satoshis || 0,
+    note: 'Poll for service-response to get the result',
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Main dispatch
 // ---------------------------------------------------------------------------
 const [,, command, ...args] = process.argv;
@@ -1262,8 +1635,15 @@ try {
     case 'verify':  await cmdVerify(args[0]); break;
     case 'accept':  await cmdAccept(args[0], args[1], args[2], args[3], args.slice(4).join(' ') || undefined); break;
 
+    // Messaging (relay)
+    case 'send':              await cmdSend(args[0], args[1], args[2]); break;
+    case 'inbox':             await cmdInbox(args); break;
+    case 'ack':               await cmdAck(args); break;
+    case 'poll':              await cmdPoll(); break;
+    case 'request-service':   await cmdRequestService(args[0], args[1], args[2]); break;
+
     default:
-      fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, services, advertise, remove, discover, pay, verify, accept`);
+      fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, services, advertise, remove, discover, pay, verify, accept, send, inbox, ack, poll, request-service`);
   }
 } catch (err) {
   fail(err instanceof Error ? err.message : String(err));
