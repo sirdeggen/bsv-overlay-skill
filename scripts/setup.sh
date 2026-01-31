@@ -61,6 +61,16 @@ if [ ! -L "$WT_LINK" ] && [ -d "$WT_PATH" ]; then
   echo "✅ Symlinked @bsv/wallet-toolbox"
 fi
 
+# 6. Install ws for WebSocket connect command
+WS_LINK="$SKILL_DIR/node_modules/ws"
+if [ ! -d "$WS_LINK" ] && [ ! -L "$WS_LINK" ]; then
+  echo "📦 Installing ws for WebSocket support..."
+  cd "$SKILL_DIR" && npm install ws --no-save 2>/dev/null || true
+  echo "✅ ws installed"
+else
+  echo "✅ ws already available"
+fi
+
 echo ""
 
 # 6. Initialize the wallet if it doesn't exist

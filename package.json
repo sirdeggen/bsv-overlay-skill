@@ -1,6 +1,6 @@
 {
   "name": "bsv-overlay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Clawdbot BSV Overlay — agent discovery, service marketplace, and micropayments on the BSV blockchain",
   "type": "module",
   "scripts": {
@@ -8,6 +8,9 @@
     "cli": "node scripts/overlay-cli.mjs"
   },
   "dependencies": {},
+  "optionalDependencies": {
+    "ws": "^8.0.0"
+  },
   "engines": {
     "node": ">=20.0.0"
   }

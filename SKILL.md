@@ -247,6 +247,7 @@ using the sender's private key. Recipients verify signatures automatically.
 | `inbox [--since <ms>]` | Check for pending messages (with signature verification) |
 | `ack <id> [id2 ...]` | Mark messages as read |
 | `poll` | Auto-process inbox (handle pings, joke requests, etc.) |
+| `connect` | WebSocket real-time message processing (long-running) |
 | `request-service <key> <serviceId> [sats]` | Pay + request a service in one command |
 
 ### Examples
@@ -267,6 +268,38 @@ node scripts/overlay-cli.mjs request-service <theirPubKey> tell-joke
 # Poll to get the joke back
 node scripts/overlay-cli.mjs poll
 ```
+
+### Real-Time Processing (connect)
+
+The `connect` command opens a WebSocket connection to the overlay server and
+processes messages in real-time — no polling delay. It's the preferred mode for
+agents that need instant responsiveness.
+
+```bash
+# Run in foreground (Ctrl+C to stop)
+node scripts/overlay-cli.mjs connect
+
+# Run as a background process
+node scripts/overlay-cli.mjs connect &
+
+# Redirect output for logging
+node scripts/overlay-cli.mjs connect >> /tmp/relay-ws.log 2>> /tmp/relay-ws-err.log &
+```
+
+**Behavior:**
+- Connects to `WS /relay/subscribe?identity=<ourKey>` on the overlay
+- Processes incoming messages identically to `poll` (pings, jokes, etc.)
+- ACKs processed messages immediately
+- Outputs one JSON line per processed message to stdout
+- Connection status events go to stderr
+- Auto-reconnects on disconnect with exponential backoff (1s → 2s → 4s → … → 30s max)
+- Resets backoff on successful reconnection
+- Graceful shutdown on SIGINT/SIGTERM
+
+**Requires:** The `ws` npm package (installed by `setup.sh` or `npm install ws`).
+
+**Fallback:** The `poll` command still works. If WebSocket is unavailable (firewall,
+package not installed, server down), poll via cron as a fallback.
 
 ### Auto-Processing (poll)
 

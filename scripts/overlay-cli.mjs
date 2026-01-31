@@ -35,6 +35,7 @@
  *   inbox [--since <ms>]                               — Check inbox for pending messages
  *   ack <messageId> [messageId2 ...]                   — Mark messages as read
  *   poll                                               — Process inbox (auto-handle known types)
+ *   connect                                            — WebSocket real-time message processing
  *   request-service <identityKey> <serviceId> [sats]   — Pay + request a service
  */
 
@@ -1381,6 +1382,282 @@ async function cmdAck(messageIds) {
   ok({ acked: result.acked, messageIds });
 }
 
+// ---------------------------------------------------------------------------
+// Shared message processing — used by both poll and connect (WebSocket)
+// ---------------------------------------------------------------------------
+
+/**
+ * Process a single relay message. Handles pings, joke service requests,
+ * pongs, service responses. Returns a result object.
+ *
+ * result.ack — whether the message should be ACKed
+ * result.id  — the message id
+ */
+async function processMessage(msg, identityKey, privKey) {
+  // Verify signature if present
+  const sigCheck = msg.signature
+    ? verifyRelaySignature(msg.from, msg.to, msg.type, msg.payload, msg.signature)
+    : { valid: null };
+
+  if (msg.type === 'ping') {
+    // Auto-respond with pong
+    const pongPayload = {
+      text: 'pong',
+      inReplyTo: msg.id,
+      originalText: msg.payload?.text || null,
+    };
+    const pongSig = signRelayMessage(privKey, msg.from, 'pong', pongPayload);
+    await fetch(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: identityKey,
+        to: msg.from,
+        type: 'pong',
+        payload: pongPayload,
+        signature: pongSig,
+      }),
+    });
+    return { id: msg.id, type: 'ping', action: 'replied-pong', from: msg.from, ack: true };
+
+  } else if (msg.type === 'service-request') {
+    const serviceId = msg.payload?.serviceId;
+    if (serviceId === 'tell-joke') {
+      return await processJokeRequest(msg, identityKey, privKey);
+    } else {
+      // Unknown service — don't auto-process
+      return {
+        id: msg.id, type: 'service-request', serviceId,
+        from: msg.from, signatureValid: sigCheck.valid,
+        action: 'unhandled', ack: false,
+      };
+    }
+
+  } else if (msg.type === 'pong') {
+    return {
+      id: msg.id, type: 'pong', action: 'received', from: msg.from,
+      text: msg.payload?.text, inReplyTo: msg.payload?.inReplyTo, ack: true,
+    };
+
+  } else if (msg.type === 'service-response') {
+    return {
+      id: msg.id, type: 'service-response', action: 'received', from: msg.from,
+      serviceId: msg.payload?.serviceId, status: msg.payload?.status,
+      result: msg.payload?.result, requestId: msg.payload?.requestId, ack: true,
+    };
+
+  } else {
+    // Unknown type
+    return {
+      id: msg.id, type: msg.type, from: msg.from,
+      payload: msg.payload, signatureValid: sigCheck.valid,
+      action: 'unhandled', ack: false,
+    };
+  }
+}
+
+/** Handle a tell-joke service request with payment verification. */
+async function processJokeRequest(msg, identityKey, privKey) {
+  const payment = msg.payload?.payment;
+
+  // Helper to send rejection
+  async function reject(reason, shortReason) {
+    const rejectPayload = {
+      requestId: msg.id, serviceId: 'tell-joke', status: 'rejected', reason,
+    };
+    const rejectSig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetch(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: identityKey, to: msg.from, type: 'service-response',
+        payload: rejectPayload, signature: rejectSig,
+      }),
+    });
+    return {
+      id: msg.id, type: 'service-request', serviceId: 'tell-joke',
+      action: 'rejected', reason: shortReason, from: msg.from, ack: true,
+    };
+  }
+
+  if (!payment || !payment.beef || !payment.satoshis) {
+    return reject('No payment included. This service costs 5 sats.', 'no payment');
+  }
+  if (payment.satoshis < 5) {
+    return reject(
+      `Insufficient payment: ${payment.satoshis} sats sent, 5 required.`,
+      `underpaid: ${payment.satoshis} < 5`,
+    );
+  }
+
+  // Decode BEEF
+  let beefBytes;
+  try {
+    beefBytes = Uint8Array.from(atob(payment.beef), c => c.charCodeAt(0));
+  } catch { beefBytes = null; }
+
+  if (!beefBytes || beefBytes.length < 20) {
+    return reject('Invalid payment BEEF. Could not decode base64.', 'invalid base64');
+  }
+
+  // Parse the payment transaction
+  let paymentTx = null;
+  let isAtomicBeef = false;
+  try { paymentTx = Transaction.fromAtomicBEEF(Array.from(beefBytes)); isAtomicBeef = true; } catch {}
+  if (!paymentTx) {
+    try {
+      const beefObj = Beef.fromBinary(Array.from(beefBytes));
+      const txs = beefObj.txs || [];
+      const newest = txs.find(t => t.tx) || txs[txs.length - 1];
+      paymentTx = newest?.tx || null;
+    } catch {}
+  }
+  if (!paymentTx) {
+    return reject('Invalid payment BEEF. Could not parse transaction.', 'unparseable BEEF');
+  }
+
+  // Find the output that pays us
+  const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
+  const walletIdentity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
+  const ourPrivKey = PrivateKey.fromHex(walletIdentity.rootKeyHex);
+  const ourPubKey = ourPrivKey.toPublicKey();
+  const ourHash160 = Hash.hash160(ourPubKey.encode(true));
+  const ourHash160Hex = Array.from(ourHash160).map(b => b.toString(16).padStart(2, '0')).join('');
+
+  let paymentOutputIndex = -1;
+  let paymentSats = 0;
+  for (let i = 0; i < paymentTx.outputs.length; i++) {
+    const scriptHex = paymentTx.outputs[i].lockingScript.toHex();
+    if (scriptHex.includes(ourHash160Hex)) {
+      paymentOutputIndex = i;
+      paymentSats = paymentTx.outputs[i].satoshis;
+      break;
+    }
+  }
+  if (paymentOutputIndex < 0) {
+    return reject('No output paying our address found in the transaction.', 'no output to us');
+  }
+  if (paymentSats < 5) {
+    return reject(`Output pays ${paymentSats} sats, minimum 5 required.`, `underpaid: ${paymentSats}`);
+  }
+
+  // Accept the payment into our wallet
+  const paymentTxid = paymentTx.id('hex');
+  let walletAccepted = false;
+  let acceptError = null;
+
+  const derivPrefix = payment.derivationPrefix || Utils.toBase64(Array.from(new TextEncoder().encode('service-payment')));
+  const derivSuffix = payment.derivationSuffix || Utils.toBase64(Array.from(new TextEncoder().encode(paymentTxid.slice(0, 16))));
+  const internalizeArgs = {
+    outputs: [{
+      outputIndex: paymentOutputIndex,
+      protocol: 'wallet payment',
+      paymentRemittance: {
+        derivationPrefix: derivPrefix, derivationSuffix: derivSuffix,
+        senderIdentityKey: msg.from,
+      },
+    }],
+    description: `Payment for tell-joke from ${msg.from.slice(0, 12)}...`,
+  };
+
+  // Attempt 1: use the BEEF bytes directly from sender
+  try {
+    const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
+    let atomicBytes;
+    if (isAtomicBeef) {
+      atomicBytes = new Uint8Array(beefBytes);
+    } else {
+      const beefObj = Beef.fromBinary(Array.from(beefBytes));
+      atomicBytes = beefObj.toBinaryAtomic(paymentTxid);
+    }
+    await wallet._setup.wallet.storage.internalizeAction({ tx: atomicBytes, ...internalizeArgs });
+    await wallet.destroy();
+    walletAccepted = true;
+  } catch (err1) {
+    // Attempt 2: rebuild BEEF from WhatsonChain
+    try {
+      const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
+      const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
+      const txChain = [];
+      let curTxid = paymentTxid;
+      let curTx = paymentTx;
+      txChain.push({ tx: curTx, txid: curTxid });
+
+      for (let depth = 0; depth < 10; depth++) {
+        const srcTxid = curTx.inputs[0].sourceTXID;
+        const srcHexResp = await fetch(`${wocBase}/tx/${srcTxid}/hex`);
+        if (!srcHexResp.ok) throw new Error(`WoC tx hex ${srcTxid.slice(0,12)}: ${srcHexResp.status}`);
+        const srcHex = await srcHexResp.text();
+        const srcTx = Transaction.fromHex(srcHex);
+
+        const srcInfoResp = await fetch(`${wocBase}/tx/${srcTxid}`);
+        if (!srcInfoResp.ok) throw new Error(`WoC tx info ${srcTxid.slice(0,12)}: ${srcInfoResp.status}`);
+        const srcInfo = await srcInfoResp.json();
+
+        if (srcInfo.confirmations > 0 && srcInfo.blockheight) {
+          const proofResp = await fetch(`${wocBase}/tx/${srcTxid}/proof/tsc`);
+          if (proofResp.ok) {
+            const proofData = await proofResp.json();
+            if (Array.isArray(proofData) && proofData.length > 0) {
+              const proof = proofData[0];
+              srcTx.merklePath = buildMerklePathFromTSC(srcTxid, proof.index, proof.nodes, srcInfo.blockheight);
+            }
+          }
+          txChain.push({ tx: srcTx, txid: srcTxid });
+          break;
+        }
+        txChain.push({ tx: srcTx, txid: srcTxid });
+        curTx = srcTx;
+        curTxid = srcTxid;
+      }
+
+      const freshBeef = new Beef();
+      for (let i = txChain.length - 1; i >= 0; i--) {
+        freshBeef.mergeTransaction(txChain[i].tx);
+      }
+      const freshAtomicBytes = new Uint8Array(freshBeef.toBinaryAtomic(paymentTxid));
+
+      const wallet2 = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
+      await wallet2._setup.wallet.storage.internalizeAction({ tx: freshAtomicBytes, ...internalizeArgs });
+      await wallet2.destroy();
+      walletAccepted = true;
+      acceptError = null;
+    } catch (err2) {
+      acceptError = `Attempt 1: ${err1 instanceof Error ? err1.message : String(err1)} | Attempt 2: ${err2 instanceof Error ? err2.message : String(err2)}`;
+    }
+  }
+
+  // Serve the joke
+  const joke = JOKES[Math.floor(Math.random() * JOKES.length)];
+  const responsePayload = {
+    requestId: msg.id, serviceId: 'tell-joke', status: 'fulfilled',
+    result: joke, paymentAccepted: true, paymentTxid,
+    satoshisReceived: paymentSats, walletAccepted,
+    ...(acceptError ? { walletError: acceptError } : {}),
+  };
+  const respSig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
+  await fetch(`${OVERLAY_URL}/relay/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: identityKey, to: msg.from, type: 'service-response',
+      payload: responsePayload, signature: respSig,
+    }),
+  });
+
+  return {
+    id: msg.id, type: 'service-request', serviceId: 'tell-joke',
+    action: 'fulfilled', joke, paymentAccepted: true, paymentTxid,
+    satoshisReceived: paymentSats, walletAccepted,
+    ...(acceptError ? { walletError: acceptError } : {}),
+    from: msg.from, ack: true,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Poll command — uses shared processMessage
+// ---------------------------------------------------------------------------
+
 async function cmdPoll() {
   const { identityKey, privKey } = loadIdentity();
 
@@ -1401,398 +1678,12 @@ async function cmdPoll() {
   const unhandled = [];
 
   for (const msg of inbox.messages) {
-    // Verify signature if present
-    const sigCheck = msg.signature
-      ? verifyRelaySignature(msg.from, msg.to, msg.type, msg.payload, msg.signature)
-      : { valid: null };
-
-    if (msg.type === 'ping') {
-      // Auto-respond with pong
-      const pongPayload = {
-        text: 'pong',
-        inReplyTo: msg.id,
-        originalText: msg.payload?.text || null,
-      };
-      const pongSig = signRelayMessage(privKey, msg.from, 'pong', pongPayload);
-      await fetch(`${OVERLAY_URL}/relay/send`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          from: identityKey,
-          to: msg.from,
-          type: 'pong',
-          payload: pongPayload,
-          signature: pongSig,
-        }),
-      });
-      ackedIds.push(msg.id);
-      processed.push({ id: msg.id, type: 'ping', action: 'replied-pong', from: msg.from });
-
-    } else if (msg.type === 'service-request') {
-      const serviceId = msg.payload?.serviceId;
-      if (serviceId === 'tell-joke') {
-        // ── Payment verification ──────────────────────────────────
-        // Reject if no payment data
-        const payment = msg.payload?.payment;
-        if (!payment || !payment.beef || !payment.satoshis) {
-          const rejectPayload = {
-            requestId: msg.id,
-            serviceId: 'tell-joke',
-            status: 'rejected',
-            reason: 'No payment included. This service costs 5 sats.',
-          };
-          const rejectSig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
-          await fetch(`${OVERLAY_URL}/relay/send`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              from: identityKey,
-              to: msg.from,
-              type: 'service-response',
-              payload: rejectPayload,
-              signature: rejectSig,
-            }),
-          });
-          ackedIds.push(msg.id);
-          processed.push({
-            id: msg.id,
-            type: 'service-request',
-            serviceId: 'tell-joke',
-            action: 'rejected',
-            reason: 'no payment',
-            from: msg.from,
-          });
-          continue;
-        }
-
-        // Reject if underpaying
-        if (payment.satoshis < 5) {
-          const rejectPayload = {
-            requestId: msg.id,
-            serviceId: 'tell-joke',
-            status: 'rejected',
-            reason: `Insufficient payment: ${payment.satoshis} sats sent, 5 required.`,
-          };
-          const rejectSig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
-          await fetch(`${OVERLAY_URL}/relay/send`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              from: identityKey,
-              to: msg.from,
-              type: 'service-response',
-              payload: rejectPayload,
-              signature: rejectSig,
-            }),
-          });
-          ackedIds.push(msg.id);
-          processed.push({
-            id: msg.id,
-            type: 'service-request',
-            serviceId: 'tell-joke',
-            action: 'rejected',
-            reason: `underpaid: ${payment.satoshis} < 5`,
-            from: msg.from,
-          });
-          continue;
-        }
-
-        // ── Verify BEEF, find our output, and accept payment into wallet ──
-        let beefBytes;
-        try {
-          beefBytes = Uint8Array.from(atob(payment.beef), c => c.charCodeAt(0));
-        } catch {
-          beefBytes = null;
-        }
-
-        if (!beefBytes || beefBytes.length < 20) {
-          const rejectPayload = {
-            requestId: msg.id,
-            serviceId: 'tell-joke',
-            status: 'rejected',
-            reason: 'Invalid payment BEEF. Could not decode base64.',
-          };
-          const rejectSig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
-          await fetch(`${OVERLAY_URL}/relay/send`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: rejectSig }),
-          });
-          ackedIds.push(msg.id);
-          processed.push({ id: msg.id, type: 'service-request', serviceId: 'tell-joke', action: 'rejected', reason: 'invalid base64', from: msg.from });
-          continue;
-        }
-
-        // Parse the payment transaction from the BEEF
-        // Moneo's buildDirectPayment sends AtomicBEEF (not regular BEEF)
-        // AtomicBEEF and regular BEEF have different binary formats
-        let paymentTx = null;
-        let isAtomicBeef = false;
-
-        // Try AtomicBEEF first (what buildDirectPayment produces)
-        try {
-          paymentTx = Transaction.fromAtomicBEEF(Array.from(beefBytes));
-          isAtomicBeef = true;
-        } catch {}
-
-        // Try regular BEEF if AtomicBEEF failed
-        if (!paymentTx) {
-          try {
-            const beefObj = Beef.fromBinary(Array.from(beefBytes));
-            const txs = beefObj.txs || [];
-            const newest = txs.find(t => t.tx) || txs[txs.length - 1];
-            paymentTx = newest?.tx || null;
-          } catch {}
-        }
-
-        if (!paymentTx) {
-          const rejectPayload = {
-            requestId: msg.id,
-            serviceId: 'tell-joke',
-            status: 'rejected',
-            reason: 'Invalid payment BEEF. Could not parse transaction.',
-          };
-          const rejectSig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
-          await fetch(`${OVERLAY_URL}/relay/send`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: rejectSig }),
-          });
-          ackedIds.push(msg.id);
-          processed.push({ id: msg.id, type: 'service-request', serviceId: 'tell-joke', action: 'rejected', reason: 'unparseable BEEF', from: msg.from });
-          continue;
-        }
-
-        // Find the output that pays us (P2PKH to our address)
-        const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
-        const walletIdentity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
-        const ourPrivKey = PrivateKey.fromHex(walletIdentity.rootKeyHex);
-        const ourPubKey = ourPrivKey.toPublicKey();
-        const ourHash160 = Hash.hash160(ourPubKey.encode(true));
-        const ourHash160Hex = Array.from(ourHash160).map(b => b.toString(16).padStart(2, '0')).join('');
-
-        let paymentOutputIndex = -1;
-        let paymentSats = 0;
-        for (let i = 0; i < paymentTx.outputs.length; i++) {
-          const scriptHex = paymentTx.outputs[i].lockingScript.toHex();
-          // P2PKH: 76a914{hash160}88ac
-          if (scriptHex.includes(ourHash160Hex)) {
-            paymentOutputIndex = i;
-            paymentSats = paymentTx.outputs[i].satoshis;
-            break;
-          }
-        }
-
-        if (paymentOutputIndex < 0 || paymentSats < 5) {
-          const rejectPayload = {
-            requestId: msg.id,
-            serviceId: 'tell-joke',
-            status: 'rejected',
-            reason: paymentOutputIndex < 0
-              ? 'No output paying our address found in the transaction.'
-              : `Output pays ${paymentSats} sats, minimum 5 required.`,
-          };
-          const rejectSig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
-          await fetch(`${OVERLAY_URL}/relay/send`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: rejectSig }),
-          });
-          ackedIds.push(msg.id);
-          processed.push({ id: msg.id, type: 'service-request', serviceId: 'tell-joke', action: 'rejected', reason: paymentOutputIndex < 0 ? 'no output to us' : `underpaid: ${paymentSats}`, from: msg.from });
-          continue;
-        }
-
-        // Accept the payment into our wallet
-        const paymentTxid = paymentTx.id('hex');
-        let walletAccepted = false;
-        let acceptError = null;
-
-        // derivationPrefix/Suffix must be valid base64 per BRC-29
-        const derivPrefix = payment.derivationPrefix || Utils.toBase64(Array.from(new TextEncoder().encode('service-payment')));
-        const derivSuffix = payment.derivationSuffix || Utils.toBase64(Array.from(new TextEncoder().encode(paymentTxid.slice(0, 16))));
-        const internalizeArgs = {
-          outputs: [{
-            outputIndex: paymentOutputIndex,
-            protocol: 'wallet payment',
-            paymentRemittance: {
-              derivationPrefix: derivPrefix,
-              derivationSuffix: derivSuffix,
-              senderIdentityKey: msg.from,
-            },
-          }],
-          description: `Payment for tell-joke from ${msg.from.slice(0, 12)}...`,
-        };
-
-        // Attempt 1: use the BEEF bytes directly from sender
-        // If it's already AtomicBEEF, pass as-is. Otherwise try to convert.
-        try {
-          const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-          let atomicBytes;
-          if (isAtomicBeef) {
-            // Already AtomicBEEF format — use directly (must be Uint8Array)
-            atomicBytes = new Uint8Array(beefBytes);
-          } else {
-            // Regular BEEF — convert to AtomicBEEF
-            const beefObj = Beef.fromBinary(Array.from(beefBytes));
-            atomicBytes = beefObj.toBinaryAtomic(paymentTxid);
-          }
-          await wallet._setup.wallet.storage.internalizeAction({
-            tx: atomicBytes,
-            ...internalizeArgs,
-          });
-          await wallet.destroy();
-          walletAccepted = true;
-        } catch (err1) {
-          // Attempt 2: rebuild BEEF by fetching full ancestor chain from WhatsonChain
-          // This handles the case where the sender's BEEF doesn't include full merkle proofs
-          try {
-            const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
-            const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
-
-            // Trace the tx chain back to a confirmed ancestor
-            const txChain = [];
-            let curTxid = paymentTxid;
-            let curTx = paymentTx;
-            txChain.push({ tx: curTx, txid: curTxid });
-
-            for (let depth = 0; depth < 10; depth++) {
-              const srcTxid = curTx.inputs[0].sourceTXID;
-              const srcHexResp = await fetch(`${wocBase}/tx/${srcTxid}/hex`);
-              if (!srcHexResp.ok) throw new Error(`WoC tx hex ${srcTxid.slice(0,12)}: ${srcHexResp.status}`);
-              const srcHex = await srcHexResp.text();
-              const srcTx = Transaction.fromHex(srcHex);
-
-              const srcInfoResp = await fetch(`${wocBase}/tx/${srcTxid}`);
-              if (!srcInfoResp.ok) throw new Error(`WoC tx info ${srcTxid.slice(0,12)}: ${srcInfoResp.status}`);
-              const srcInfo = await srcInfoResp.json();
-
-              if (srcInfo.confirmations > 0 && srcInfo.blockheight) {
-                // Confirmed — fetch merkle proof
-                const proofResp = await fetch(`${wocBase}/tx/${srcTxid}/proof/tsc`);
-                if (proofResp.ok) {
-                  const proofData = await proofResp.json();
-                  if (Array.isArray(proofData) && proofData.length > 0) {
-                    const proof = proofData[0];
-                    srcTx.merklePath = buildMerklePathFromTSC(srcTxid, proof.index, proof.nodes, srcInfo.blockheight);
-                  }
-                }
-                txChain.push({ tx: srcTx, txid: srcTxid });
-                break;
-              }
-              txChain.push({ tx: srcTx, txid: srcTxid });
-              curTx = srcTx;
-              curTxid = srcTxid;
-            }
-
-            // Rebuild BEEF from confirmed ancestor up
-            const freshBeef = new Beef();
-            for (let i = txChain.length - 1; i >= 0; i--) {
-              freshBeef.mergeTransaction(txChain[i].tx);
-            }
-            const freshAtomicBytes = new Uint8Array(freshBeef.toBinaryAtomic(paymentTxid));
-
-            const wallet2 = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-            await wallet2._setup.wallet.storage.internalizeAction({
-              tx: freshAtomicBytes,
-              ...internalizeArgs,
-            });
-            await wallet2.destroy();
-            walletAccepted = true;
-            acceptError = null;
-          } catch (err2) {
-            acceptError = `Attempt 1: ${err1 instanceof Error ? err1.message : String(err1)} | Attempt 2: ${err2 instanceof Error ? err2.message : String(err2)}`;
-          }
-        }
-
-        // ── Payment accepted — serve the joke ─────────────────────
-        // Pick a random joke
-        const joke = JOKES[Math.floor(Math.random() * JOKES.length)];
-
-        // Send response
-        const responsePayload = {
-          requestId: msg.id,
-          serviceId: 'tell-joke',
-          status: 'fulfilled',
-          result: joke,
-          paymentAccepted: true,
-          paymentTxid,
-          satoshisReceived: paymentSats,
-          walletAccepted,
-          ...(acceptError ? { walletError: acceptError } : {}),
-        };
-        const respSig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
-        await fetch(`${OVERLAY_URL}/relay/send`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            from: identityKey,
-            to: msg.from,
-            type: 'service-response',
-            payload: responsePayload,
-            signature: respSig,
-          }),
-        });
-        ackedIds.push(msg.id);
-        processed.push({
-          id: msg.id,
-          type: 'service-request',
-          serviceId: 'tell-joke',
-          action: 'fulfilled',
-          joke,
-          paymentAccepted: true,
-          paymentTxid,
-          satoshisReceived: paymentSats,
-          walletAccepted,
-          ...(acceptError ? { walletError: acceptError } : {}),
-          from: msg.from,
-        });
-      } else {
-        // Unknown service — don't auto-process
-        unhandled.push({
-          id: msg.id,
-          type: 'service-request',
-          serviceId,
-          from: msg.from,
-          signatureValid: sigCheck.valid,
-        });
-      }
-
-    } else if (msg.type === 'pong') {
-      // Pong responses — just ack them
-      ackedIds.push(msg.id);
-      processed.push({
-        id: msg.id,
-        type: 'pong',
-        action: 'received',
-        from: msg.from,
-        text: msg.payload?.text,
-        inReplyTo: msg.payload?.inReplyTo,
-      });
-
-    } else if (msg.type === 'service-response') {
-      // Service responses — ack and report
-      ackedIds.push(msg.id);
-      processed.push({
-        id: msg.id,
-        type: 'service-response',
-        action: 'received',
-        from: msg.from,
-        serviceId: msg.payload?.serviceId,
-        status: msg.payload?.status,
-        result: msg.payload?.result,
-        requestId: msg.payload?.requestId,
-      });
-
+    const result = await processMessage(msg, identityKey, privKey);
+    if (result.ack) {
+      ackedIds.push(result.id);
+      processed.push(result);
     } else {
-      // Unknown type — don't auto-process
-      unhandled.push({
-        id: msg.id,
-        type: msg.type,
-        from: msg.from,
-        payload: msg.payload,
-        signatureValid: sigCheck.valid,
-      });
+      unhandled.push(result);
     }
   }
 
@@ -1813,6 +1704,90 @@ async function cmdPoll() {
     unhandledMessages: unhandled,
     ackedIds,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Connect command — WebSocket real-time message processing
+// ---------------------------------------------------------------------------
+
+async function cmdConnect() {
+  let WebSocketClient;
+  try {
+    const ws = await import('ws');
+    WebSocketClient = ws.default || ws.WebSocket || ws;
+  } catch {
+    return fail('WebSocket client not available. Install it: npm install ws (in the skill directory)');
+  }
+
+  const { identityKey, privKey } = loadIdentity();
+  const wsUrl = OVERLAY_URL.replace(/^http/, 'ws') + '/relay/subscribe?identity=' + identityKey;
+
+  let reconnectDelay = 1000;
+  let shouldReconnect = true;
+  let currentWs = null;
+
+  function shutdown() {
+    shouldReconnect = false;
+    if (currentWs) {
+      try { currentWs.close(); } catch {}
+    }
+    process.exit(0);
+  }
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  function connect() {
+    const ws = new WebSocketClient(wsUrl);
+    currentWs = ws;
+
+    ws.on('open', () => {
+      reconnectDelay = 1000; // reset on successful connect
+      console.error(JSON.stringify({ event: 'connected', identity: identityKey, overlay: OVERLAY_URL }));
+    });
+
+    ws.on('message', async (data) => {
+      try {
+        const envelope = JSON.parse(data.toString());
+        if (envelope.type === 'message') {
+          const result = await processMessage(envelope.message, identityKey, privKey);
+          // Output the result as a JSON line to stdout
+          console.log(JSON.stringify(result));
+          // Ack the message
+          if (result.ack) {
+            try {
+              await fetch(OVERLAY_URL + '/relay/ack', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ identity: identityKey, messageIds: [result.id] }),
+              });
+            } catch (ackErr) {
+              console.error(JSON.stringify({ event: 'ack-error', id: result.id, message: String(ackErr) }));
+            }
+          }
+        }
+        // Ignore 'connected' type — just informational
+      } catch (err) {
+        console.error(JSON.stringify({ event: 'process-error', message: String(err) }));
+      }
+    });
+
+    ws.on('close', () => {
+      currentWs = null;
+      if (shouldReconnect) {
+        console.error(JSON.stringify({ event: 'disconnected', reconnectMs: reconnectDelay }));
+        setTimeout(connect, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+      }
+    });
+
+    ws.on('error', (err) => {
+      console.error(JSON.stringify({ event: 'error', message: err.message }));
+    });
+  }
+
+  connect();
+  // Keep the process alive — never resolves
+  await new Promise(() => {});
 }
 
 async function cmdRequestService(targetKey, serviceId, satsStr) {
@@ -1920,10 +1895,11 @@ try {
     case 'inbox':             await cmdInbox(args); break;
     case 'ack':               await cmdAck(args); break;
     case 'poll':              await cmdPoll(); break;
+    case 'connect':           await cmdConnect(); break;
     case 'request-service':   await cmdRequestService(args[0], args[1], args[2]); break;
 
     default:
-      fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, services, advertise, remove, discover, pay, verify, accept, send, inbox, ack, poll, request-service`);
+      fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, services, advertise, remove, discover, pay, verify, accept, send, inbox, ack, poll, connect, request-service`);
   }
 } catch (err) {
   fail(err instanceof Error ? err.message : String(err));
