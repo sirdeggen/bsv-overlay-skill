@@ -1527,6 +1527,8 @@ async function processMessage(msg, identityKey, privKey) {
       return await processJokeRequest(msg, identityKey, privKey);
     } else if (serviceId === 'code-review') {
       return await processCodeReview(msg, identityKey, privKey);
+    } else if (serviceId === 'web-research') {
+      return await processWebResearch(msg, identityKey, privKey);
     } else {
       // Unknown service — don't auto-process
       return {
@@ -1891,6 +1893,309 @@ async function performCodeReview(input) {
   }
 
   return { type: 'code-review', error: 'Provide either {prUrl} or {code, language} in the input.' };
+}
+
+// ---------------------------------------------------------------------------
+// Service: web-research (50 sats)
+// ---------------------------------------------------------------------------
+
+async function processWebResearch(msg, identityKey, privKey) {
+  const PRICE = 50;
+  const payment = msg.payload?.payment;
+  const input = msg.payload?.input || msg.payload;
+  const query = input?.query || input?.question || input?.q;
+
+  if (!query || typeof query !== 'string' || query.trim().length < 3) {
+    // Send rejection — no valid query
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'web-research',
+      status: 'rejected',
+      reason: 'Missing or invalid query. Send {input: {query: "your question"}}',
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetch(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'web-research', action: 'rejected', reason: 'no query', from: msg.from, ack: true };
+  }
+
+  // ── Payment verification (same pattern as other services) ──
+  if (!payment || !payment.beef || !payment.satoshis) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'web-research',
+      status: 'rejected',
+      reason: `No payment included. Web research costs ${PRICE} sats.`,
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetch(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'web-research', action: 'rejected', reason: 'no payment', from: msg.from, ack: true };
+  }
+
+  if (payment.satoshis < PRICE) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'web-research',
+      status: 'rejected',
+      reason: `Insufficient payment: ${payment.satoshis} sats sent, ${PRICE} required.`,
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetch(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'web-research', action: 'rejected', reason: `underpaid: ${payment.satoshis} < ${PRICE}`, from: msg.from, ack: true };
+  }
+
+  // ── Validate BEEF ──
+  let beefBytes;
+  try { beefBytes = Uint8Array.from(atob(payment.beef), c => c.charCodeAt(0)); } catch { beefBytes = null; }
+  let paymentTx = null;
+  let isAtomicBeef = false;
+  if (beefBytes && beefBytes.length > 20) {
+    try { paymentTx = Transaction.fromAtomicBEEF(Array.from(beefBytes)); isAtomicBeef = true; } catch {}
+    if (!paymentTx) try { const b = Beef.fromBinary(Array.from(beefBytes)); paymentTx = b.txs?.find(t => t.tx)?.tx; } catch {}
+  }
+  if (!paymentTx) {
+    const rejectPayload = { requestId: msg.id, serviceId: 'web-research', status: 'rejected', reason: 'Invalid payment BEEF.' };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetch(`${OVERLAY_URL}/relay/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }) });
+    return { id: msg.id, type: 'service-request', serviceId: 'web-research', action: 'rejected', reason: 'invalid BEEF', from: msg.from, ack: true };
+  }
+
+  // ── Find our output & accept payment ──
+  const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
+  const walletIdentity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
+  const ourPrivKey = PrivateKey.fromHex(walletIdentity.rootKeyHex);
+  const ourPubKey = ourPrivKey.toPublicKey();
+  const ourHash160 = Hash.hash160(ourPubKey.encode(true));
+  const ourHash160Hex = Array.from(ourHash160).map(b => b.toString(16).padStart(2, '0')).join('');
+
+  let paymentOutputIndex = -1;
+  let paymentSats = 0;
+  for (let i = 0; i < paymentTx.outputs.length; i++) {
+    const scriptHex = paymentTx.outputs[i].lockingScript.toHex();
+    if (scriptHex.includes(ourHash160Hex)) { paymentOutputIndex = i; paymentSats = paymentTx.outputs[i].satoshis; break; }
+  }
+  if (paymentOutputIndex < 0 || paymentSats < PRICE) {
+    const rejectPayload = { requestId: msg.id, serviceId: 'web-research', status: 'rejected', reason: paymentOutputIndex < 0 ? 'No output paying our address.' : `Output pays ${paymentSats} sats, ${PRICE} required.` };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetch(`${OVERLAY_URL}/relay/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }) });
+    return { id: msg.id, type: 'service-request', serviceId: 'web-research', action: 'rejected', reason: paymentOutputIndex < 0 ? 'no output to us' : `underpaid output: ${paymentSats}`, from: msg.from, ack: true };
+  }
+
+  const paymentTxid = paymentTx.id('hex');
+
+  // Accept into wallet
+  let walletAccepted = false;
+  let acceptError = null;
+  const derivPrefix = Utils.toBase64(Array.from(new TextEncoder().encode('web-research')));
+  const derivSuffix = Utils.toBase64(Array.from(new TextEncoder().encode(paymentTxid.slice(0, 16))));
+  try {
+    const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
+    const atomicBytes = isAtomicBeef ? new Uint8Array(beefBytes) : new Uint8Array(Beef.fromBinary(Array.from(beefBytes)).toBinaryAtomic(paymentTxid));
+    await wallet._setup.wallet.storage.internalizeAction({
+      tx: atomicBytes,
+      outputs: [{ outputIndex: paymentOutputIndex, protocol: 'wallet payment', paymentRemittance: { derivationPrefix: derivPrefix, derivationSuffix: derivSuffix, senderIdentityKey: msg.from } }],
+      description: `Web research payment from ${msg.from.slice(0, 12)}...`,
+    });
+    await wallet.destroy();
+    walletAccepted = true;
+  } catch (err1) {
+    try {
+      const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
+      const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
+      const txChain = [];
+      let curTx = paymentTx;
+      let curTxid = paymentTxid;
+      txChain.push({ tx: curTx, txid: curTxid });
+      for (let depth = 0; depth < 10; depth++) {
+        const srcTxid = curTx.inputs[0].sourceTXID;
+        const srcHexResp = await wocFetch(`/tx/${srcTxid}/hex`);
+        if (!srcHexResp.ok) throw new Error(`WoC ${srcHexResp.status}`);
+        const srcTx = Transaction.fromHex(await srcHexResp.text());
+        const srcInfoResp = await wocFetch(`/tx/${srcTxid}`);
+        if (!srcInfoResp.ok) throw new Error(`WoC ${srcInfoResp.status}`);
+        const srcInfo = await srcInfoResp.json();
+        if (srcInfo.confirmations > 0 && srcInfo.blockheight) {
+          const proofResp = await wocFetch(`/tx/${srcTxid}/proof/tsc`);
+          if (proofResp.ok) {
+            const pd = await proofResp.json();
+            if (Array.isArray(pd) && pd.length > 0) srcTx.merklePath = buildMerklePathFromTSC(srcTxid, pd[0].index, pd[0].nodes, srcInfo.blockheight);
+          }
+          txChain.push({ tx: srcTx, txid: srcTxid });
+          break;
+        }
+        txChain.push({ tx: srcTx, txid: srcTxid });
+        curTx = srcTx;
+        curTxid = srcTxid;
+      }
+      const freshBeef = new Beef();
+      for (let i = txChain.length - 1; i >= 0; i--) freshBeef.mergeTransaction(txChain[i].tx);
+      const freshAtomicBytes = new Uint8Array(freshBeef.toBinaryAtomic(paymentTxid));
+      const wallet2 = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
+      await wallet2._setup.wallet.storage.internalizeAction({
+        tx: freshAtomicBytes,
+        outputs: [{ outputIndex: paymentOutputIndex, protocol: 'wallet payment', paymentRemittance: { derivationPrefix: derivPrefix, derivationSuffix: derivSuffix, senderIdentityKey: msg.from } }],
+        description: `Web research payment from ${msg.from.slice(0, 12)}...`,
+      });
+      await wallet2.destroy();
+      walletAccepted = true;
+      acceptError = null;
+    } catch (err2) {
+      acceptError = `Attempt 1: ${err1.message} | Attempt 2: ${err2.message}`;
+    }
+  }
+
+  // ── Perform the web research ──
+  let researchResult;
+  try {
+    researchResult = await performWebResearch(query.trim());
+  } catch (e) {
+    researchResult = { error: `Research failed: ${e.message}` };
+  }
+
+  // ── Send response ──
+  const responsePayload = {
+    requestId: msg.id,
+    serviceId: 'web-research',
+    status: researchResult.error ? 'partial' : 'fulfilled',
+    result: researchResult,
+    paymentAccepted: true,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    ...(acceptError ? { walletError: acceptError } : {}),
+  };
+  const sig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
+  await fetch(`${OVERLAY_URL}/relay/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: responsePayload, signature: sig }),
+  });
+
+  return {
+    id: msg.id,
+    type: 'service-request',
+    serviceId: 'web-research',
+    action: researchResult.error ? 'partial' : 'fulfilled',
+    query: query.slice(0, 80),
+    sourcesCount: researchResult.sources?.length || 0,
+    paymentAccepted: true,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    ...(acceptError ? { walletError: acceptError } : {}),
+    from: msg.from,
+    ack: true,
+  };
+}
+
+/**
+ * Perform web research using Brave Search API via fetch.
+ * Returns a synthesized answer with sources — no LLM, just structured extraction.
+ */
+async function performWebResearch(query) {
+  // Use Brave Search API
+  const BRAVE_API_KEY = process.env.BRAVE_API_KEY || '';
+  let searchResults;
+
+  // Try Brave Search first
+  if (BRAVE_API_KEY) {
+    const searchResp = await fetch(`https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=8`, {
+      headers: { 'Accept': 'application/json', 'X-Subscription-Token': BRAVE_API_KEY },
+    });
+    if (searchResp.ok) {
+      const data = await searchResp.json();
+      searchResults = data.web?.results || [];
+    }
+  }
+
+  // Fallback: DuckDuckGo HTML search (no API key needed)
+  if (!searchResults || searchResults.length === 0) {
+    try {
+      const ddgResp = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ClawdbotAgent/1.0)' },
+      });
+      if (ddgResp.ok) {
+        const html = await ddgResp.text();
+        const results = [];
+        // Extract result links and titles
+        const linkMatches = [...html.matchAll(/<a rel="nofollow" class="result__a" href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g)];
+        // Extract snippets
+        const snippetMatches = [...html.matchAll(/<a class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g)];
+        for (let i = 0; i < linkMatches.length && i < 8; i++) {
+          let url = linkMatches[i][1];
+          // DDG wraps URLs in redirects
+          const uddg = url.match(/uddg=([^&]+)/);
+          if (uddg) url = decodeURIComponent(uddg[1]);
+          const title = linkMatches[i][2].replace(/<[^>]+>/g, '').trim();
+          const snippet = snippetMatches[i] ? snippetMatches[i][1].replace(/<[^>]+>/g, '').trim() : '';
+          results.push({ title, url, description: snippet });
+        }
+        if (results.length > 0) searchResults = results;
+      }
+    } catch {}
+  }
+
+  // Last resort: DuckDuckGo instant answers API
+  if (!searchResults || searchResults.length === 0) {
+    try {
+      const ddgResp = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1`);
+      if (ddgResp.ok) {
+        const ddg = await ddgResp.json();
+        const results = [];
+        if (ddg.Abstract) results.push({ title: ddg.Heading || query, url: ddg.AbstractURL || '', description: ddg.Abstract });
+        if (ddg.RelatedTopics) {
+          for (const topic of ddg.RelatedTopics.slice(0, 6)) {
+            if (topic.Text && topic.FirstURL) results.push({ title: topic.Text.slice(0, 100), url: topic.FirstURL, description: topic.Text });
+          }
+        }
+        if (results.length > 0) searchResults = results;
+      }
+    } catch {}
+  }
+
+  if (!searchResults || searchResults.length === 0) {
+    return { error: 'No search results found. Try a different query.', query };
+  }
+
+  // Synthesize the results into a structured answer
+  const sources = searchResults.slice(0, 8).map((r, i) => ({
+    rank: i + 1,
+    title: r.title || 'Untitled',
+    url: r.url || '',
+    snippet: (r.description || r.snippet || '').slice(0, 300),
+  }));
+
+  // Build a summary from the top snippets
+  const topSnippets = sources.slice(0, 4).map(s => s.snippet).filter(Boolean);
+  const summary = topSnippets.length > 0
+    ? topSnippets.join(' | ').slice(0, 800)
+    : 'Multiple sources found — see details below.';
+
+  // Extract key facts/entities from snippets
+  const allText = sources.map(s => s.snippet).join(' ');
+  const numbers = [...new Set(allText.match(/\$[\d,.]+|\d+%|\d{4}/g) || [])].slice(0, 5);
+  const entities = [...new Set(allText.match(/[A-Z][a-z]+(?:\s[A-Z][a-z]+)+/g) || [])].slice(0, 5);
+
+  return {
+    query,
+    summary,
+    sources,
+    keyFacts: numbers.length > 0 ? numbers : undefined,
+    keyEntities: entities.length > 0 ? entities : undefined,
+    resultCount: sources.length,
+    timestamp: new Date().toISOString(),
+  };
 }
 
 /** Analyze a GitHub PR diff for common issues. */
