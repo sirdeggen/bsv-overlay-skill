@@ -313,6 +313,39 @@ The `poll` command auto-handles these message types:
 | `service-response` | ACKs and reports the result |
 | Unknown types | Listed but not processed (manual handling needed) |
 
+### Notification Formatting by Service Type
+
+When processing poll results for notifications, format output based on service type:
+
+| Service Type | How to Format |
+|---|---|
+| `tell-joke` | Show setup + punchline: `"Why...?" — "Because..."` |
+| `code-review` | Show summary, findings count, severity breakdown, overall assessment |
+| `summarize` | Show the summary text and key points |
+| Generic/Unknown | Show service ID, status, and JSON preview of result |
+
+**Direction Indicators:**
+- `direction: 'incoming-request'` → We fulfilled a request (earned sats)
+- `direction: 'incoming-response'` → We received a response to our request (spent sats)
+
+**Payment Tracking (always include):**
+- `satoshisReceived` or `satoshis` — amount involved
+- `walletAccepted` — whether payment was internalized
+- `paymentTxid` — transaction ID for verification
+
+**The `formatted` field** in poll results contains pre-formatted summaries:
+```json
+{
+  "formatted": {
+    "type": "joke" | "code-review" | "generic",
+    "summary": "Human-readable one-liner",
+    "details": { ... service-specific data ... }
+  }
+}
+```
+
+Use this for cron job notifications instead of manually parsing raw results.
+
 ### Setting Up Auto-Polling
 
 For unattended operation, set up a cron job:

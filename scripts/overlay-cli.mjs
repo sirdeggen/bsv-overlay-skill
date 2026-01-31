@@ -1279,6 +1279,84 @@ function verifyRelaySignature(fromKey, to, type, payload, signatureHex) {
   }
 }
 
+/**
+ * Format a service response into a human-readable summary based on service type.
+ * Returns an object with { type, summary, details } for notification formatting.
+ */
+function formatServiceResponse(serviceId, status, result) {
+  const base = { serviceId, status };
+  
+  if (status === 'rejected') {
+    return {
+      ...base,
+      type: 'rejection',
+      summary: `Service rejected: ${result?.reason || 'unknown reason'}`,
+      details: result,
+    };
+  }
+  
+  switch (serviceId) {
+    case 'tell-joke':
+      return {
+        ...base,
+        type: 'joke',
+        summary: result?.setup && result?.punchline
+          ? `${result.setup} — ${result.punchline}`
+          : 'Joke received',
+        details: { setup: result?.setup, punchline: result?.punchline },
+      };
+    
+    case 'code-review':
+      // Code review results include summary, findings, severity breakdown
+      const findings = result?.findings || [];
+      const severityCounts = findings.reduce((acc, f) => {
+        acc[f.severity] = (acc[f.severity] || 0) + 1;
+        return acc;
+      }, {});
+      const severityStr = Object.entries(severityCounts)
+        .map(([k, v]) => `${v} ${k}`)
+        .join(', ') || 'none';
+      
+      return {
+        ...base,
+        type: 'code-review',
+        summary: result?.summary || 'Code review completed',
+        details: {
+          findingsCount: findings.length,
+          severityBreakdown: severityCounts,
+          assessment: result?.assessment || result?.overallAssessment,
+          findings: findings.slice(0, 5), // First 5 findings for preview
+        },
+        displaySummary: `Code Review: ${findings.length} findings (${severityStr}). ${result?.assessment || ''}`,
+      };
+    
+    case 'summarize':
+      return {
+        ...base,
+        type: 'summarize',
+        summary: result?.summary || 'Summary generated',
+        details: {
+          summary: result?.summary,
+          keyPoints: result?.keyPoints,
+          wordCount: result?.wordCount,
+        },
+      };
+    
+    default:
+      // Generic service response — show preview of result
+      const resultPreview = result
+        ? JSON.stringify(result).slice(0, 200) + (JSON.stringify(result).length > 200 ? '...' : '')
+        : 'No result data';
+      return {
+        ...base,
+        type: 'generic',
+        summary: `Service '${serviceId}' completed`,
+        details: result,
+        resultPreview,
+      };
+  }
+}
+
 const JOKES = [
   { setup: "Why do programmers prefer dark mode?", punchline: "Because light attracts bugs." },
   { setup: "Why did the BSV go to therapy?", punchline: "It had too many unresolved transactions." },
@@ -1442,10 +1520,19 @@ async function processMessage(msg, identityKey, privKey) {
     };
 
   } else if (msg.type === 'service-response') {
+    const serviceId = msg.payload?.serviceId;
+    const status = msg.payload?.status;
+    const result = msg.payload?.result;
+    
+    // Format summary based on service type
+    const formatted = formatServiceResponse(serviceId, status, result);
+    
     return {
       id: msg.id, type: 'service-response', action: 'received', from: msg.from,
-      serviceId: msg.payload?.serviceId, status: msg.payload?.status,
-      result: msg.payload?.result, requestId: msg.payload?.requestId, ack: true,
+      serviceId, status, result, requestId: msg.payload?.requestId,
+      direction: 'incoming-response', // We requested, they responded
+      formatted, // Human-readable summary
+      ack: true,
     };
 
   } else {
@@ -2007,6 +2094,12 @@ async function processJokeRequest(msg, identityKey, privKey) {
     id: msg.id, type: 'service-request', serviceId: 'tell-joke',
     action: 'fulfilled', joke, paymentAccepted: true, paymentTxid,
     satoshisReceived: paymentSats, walletAccepted,
+    direction: 'incoming-request', // We received a request and earned sats
+    formatted: {
+      type: 'joke-fulfilled',
+      summary: `Joke served: "${joke.setup}" — "${joke.punchline}"`,
+      earnings: paymentSats,
+    },
     ...(acceptError ? { walletError: acceptError } : {}),
     from: msg.from, ack: true,
   };
