@@ -1630,8 +1630,8 @@ async function cmdPoll() {
           const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
           let atomicBytes;
           if (isAtomicBeef) {
-            // Already AtomicBEEF format — use directly
-            atomicBytes = Array.from(beefBytes);
+            // Already AtomicBEEF format — use directly (must be Uint8Array)
+            atomicBytes = new Uint8Array(beefBytes);
           } else {
             // Regular BEEF — convert to AtomicBEEF
             const beefObj = Beef.fromBinary(Array.from(beefBytes));
@@ -1690,7 +1690,7 @@ async function cmdPoll() {
             for (let i = txChain.length - 1; i >= 0; i--) {
               freshBeef.mergeTransaction(txChain[i].tx);
             }
-            const freshAtomicBytes = freshBeef.toBinaryAtomic(paymentTxid);
+            const freshAtomicBytes = new Uint8Array(freshBeef.toBinaryAtomic(paymentTxid));
 
             const wallet2 = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
             await wallet2._setup.wallet.storage.internalizeAction({
