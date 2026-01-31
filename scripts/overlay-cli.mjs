@@ -1424,6 +1424,8 @@ async function processMessage(msg, identityKey, privKey) {
     const serviceId = msg.payload?.serviceId;
     if (serviceId === 'tell-joke') {
       return await processJokeRequest(msg, identityKey, privKey);
+    } else if (serviceId === 'code-review') {
+      return await processCodeReview(msg, identityKey, privKey);
     } else {
       // Unknown service — don't auto-process
       return {
@@ -1454,6 +1456,362 @@ async function processMessage(msg, identityKey, privKey) {
       action: 'unhandled', ack: false,
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Code-review service
+// ---------------------------------------------------------------------------
+
+async function processCodeReview(msg, identityKey, privKey) {
+  const payment = msg.payload?.payment;
+
+  // Helper to send rejection
+  async function reject(reason, shortReason) {
+    const rejectPayload = {
+      requestId: msg.id, serviceId: 'code-review', status: 'rejected', reason,
+    };
+    const rejectSig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetch(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: identityKey, to: msg.from, type: 'service-response',
+        payload: rejectPayload, signature: rejectSig,
+      }),
+    });
+    return {
+      id: msg.id, type: 'service-request', serviceId: 'code-review',
+      action: 'rejected', reason: shortReason, from: msg.from, ack: true,
+    };
+  }
+
+  if (!payment || !payment.beef || !payment.satoshis) {
+    return reject('No payment included. This service costs 50 sats.', 'no payment');
+  }
+  if (payment.satoshis < 50) {
+    return reject(
+      `Insufficient payment: ${payment.satoshis} sats sent, 50 required.`,
+      `underpaid: ${payment.satoshis} < 50`,
+    );
+  }
+
+  // Decode BEEF
+  let beefBytes;
+  try {
+    beefBytes = Uint8Array.from(atob(payment.beef), c => c.charCodeAt(0));
+  } catch { beefBytes = null; }
+
+  if (!beefBytes || beefBytes.length < 20) {
+    return reject('Invalid payment BEEF. Could not decode base64.', 'invalid base64');
+  }
+
+  // Parse the payment transaction
+  let paymentTx = null;
+  let isAtomicBeef = false;
+  try { paymentTx = Transaction.fromAtomicBEEF(Array.from(beefBytes)); isAtomicBeef = true; } catch {}
+  if (!paymentTx) {
+    try {
+      const beefObj = Beef.fromBinary(Array.from(beefBytes));
+      const txs = beefObj.txs || [];
+      const newest = txs.find(t => t.tx) || txs[txs.length - 1];
+      paymentTx = newest?.tx || null;
+    } catch {}
+  }
+  if (!paymentTx) {
+    return reject('Invalid payment BEEF. Could not parse transaction.', 'unparseable BEEF');
+  }
+
+  // Find the output that pays us
+  const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
+  const walletIdentity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
+  const ourPrivKey = PrivateKey.fromHex(walletIdentity.rootKeyHex);
+  const ourPubKey = ourPrivKey.toPublicKey();
+  const ourHash160 = Hash.hash160(ourPubKey.encode(true));
+  const ourHash160Hex = Array.from(ourHash160).map(b => b.toString(16).padStart(2, '0')).join('');
+
+  let paymentOutputIndex = -1;
+  let paymentSats = 0;
+  for (let i = 0; i < paymentTx.outputs.length; i++) {
+    const scriptHex = paymentTx.outputs[i].lockingScript.toHex();
+    if (scriptHex.includes(ourHash160Hex)) {
+      paymentOutputIndex = i;
+      paymentSats = paymentTx.outputs[i].satoshis;
+      break;
+    }
+  }
+  if (paymentOutputIndex < 0) {
+    return reject('No output paying our address found in the transaction.', 'no output to us');
+  }
+  if (paymentSats < 50) {
+    return reject(`Output pays ${paymentSats} sats, minimum 50 required.`, `underpaid: ${paymentSats}`);
+  }
+
+  // Accept the payment into our wallet
+  const paymentTxid = paymentTx.id('hex');
+  let walletAccepted = false;
+  let acceptError = null;
+
+  const derivPrefix = payment.derivationPrefix || Utils.toBase64(Array.from(new TextEncoder().encode('service-payment')));
+  const derivSuffix = payment.derivationSuffix || Utils.toBase64(Array.from(new TextEncoder().encode(paymentTxid.slice(0, 16))));
+  const internalizeArgs = {
+    outputs: [{
+      outputIndex: paymentOutputIndex,
+      protocol: 'wallet payment',
+      paymentRemittance: {
+        derivationPrefix: derivPrefix, derivationSuffix: derivSuffix,
+        senderIdentityKey: msg.from,
+      },
+    }],
+    description: `Payment for code-review from ${msg.from.slice(0, 12)}...`,
+  };
+
+  try {
+    const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
+    let atomicBytes;
+    if (isAtomicBeef) {
+      atomicBytes = new Uint8Array(beefBytes);
+    } else {
+      const beefObj = Beef.fromBinary(Array.from(beefBytes));
+      atomicBytes = beefObj.toBinaryAtomic(paymentTxid);
+    }
+    await wallet._setup.wallet.storage.internalizeAction({ tx: atomicBytes, ...internalizeArgs });
+    await wallet.destroy();
+    walletAccepted = true;
+  } catch (err1) {
+    try {
+      const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
+      const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
+      const txChain = [];
+      let curTxid = paymentTxid;
+      let curTx = paymentTx;
+      txChain.push({ tx: curTx, txid: curTxid });
+
+      for (let depth = 0; depth < 10; depth++) {
+        const srcTxid = curTx.inputs[0].sourceTXID;
+        const srcHexResp = await fetch(`${wocBase}/tx/${srcTxid}/hex`);
+        if (!srcHexResp.ok) throw new Error(`WoC tx hex ${srcTxid.slice(0,12)}: ${srcHexResp.status}`);
+        const srcHex = await srcHexResp.text();
+        const srcTx = Transaction.fromHex(srcHex);
+
+        const srcInfoResp = await fetch(`${wocBase}/tx/${srcTxid}`);
+        if (!srcInfoResp.ok) throw new Error(`WoC tx info ${srcTxid.slice(0,12)}: ${srcInfoResp.status}`);
+        const srcInfo = await srcInfoResp.json();
+
+        if (srcInfo.confirmations > 0 && srcInfo.blockheight) {
+          const proofResp = await fetch(`${wocBase}/tx/${srcTxid}/proof/tsc`);
+          if (proofResp.ok) {
+            const proofData = await proofResp.json();
+            if (Array.isArray(proofData) && proofData.length > 0) {
+              const proof = proofData[0];
+              srcTx.merklePath = buildMerklePathFromTSC(srcTxid, proof.index, proof.nodes, srcInfo.blockheight);
+            }
+          }
+          txChain.push({ tx: srcTx, txid: srcTxid });
+          break;
+        }
+        txChain.push({ tx: srcTx, txid: srcTxid });
+        curTx = srcTx;
+        curTxid = srcTxid;
+      }
+
+      const freshBeef = new Beef();
+      for (let i = txChain.length - 1; i >= 0; i--) {
+        freshBeef.mergeTransaction(txChain[i].tx);
+      }
+      const freshAtomicBytes = new Uint8Array(freshBeef.toBinaryAtomic(paymentTxid));
+
+      const wallet2 = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
+      await wallet2._setup.wallet.storage.internalizeAction({ tx: freshAtomicBytes, ...internalizeArgs });
+      await wallet2.destroy();
+      walletAccepted = true;
+      acceptError = null;
+    } catch (err2) {
+      acceptError = `Attempt 1: ${err1 instanceof Error ? err1.message : String(err1)} | Attempt 2: ${err2 instanceof Error ? err2.message : String(err2)}`;
+    }
+  }
+
+  // Perform the code review
+  const input = msg.payload?.input || msg.payload;
+  let reviewResult;
+  try {
+    reviewResult = await performCodeReview(input);
+  } catch (err) {
+    reviewResult = { type: 'code-review', error: `Review failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+
+  // Send response
+  const responsePayload = {
+    requestId: msg.id, serviceId: 'code-review', status: 'fulfilled',
+    result: reviewResult, paymentAccepted: true, paymentTxid,
+    satoshisReceived: paymentSats, walletAccepted,
+    ...(acceptError ? { walletError: acceptError } : {}),
+  };
+  const respSig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
+  await fetch(`${OVERLAY_URL}/relay/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: identityKey, to: msg.from, type: 'service-response',
+      payload: responsePayload, signature: respSig,
+    }),
+  });
+
+  return {
+    id: msg.id, type: 'service-request', serviceId: 'code-review',
+    action: 'fulfilled', review: reviewResult, paymentAccepted: true, paymentTxid,
+    satoshisReceived: paymentSats, walletAccepted,
+    ...(acceptError ? { walletError: acceptError } : {}),
+    from: msg.from, ack: true,
+  };
+}
+
+/** Perform code review on a PR URL or code snippet. */
+async function performCodeReview(input) {
+  if (input.prUrl) {
+    const match = input.prUrl.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+    if (!match) return { type: 'code-review', error: 'Invalid PR URL format. Expected: https://github.com/owner/repo/pull/123' };
+    const [, owner, repo, prNumber] = match;
+
+    const { execSync } = await import('child_process');
+    let prInfo, prDiff;
+    try {
+      prInfo = JSON.parse(execSync(
+        `gh pr view ${prNumber} --repo ${owner}/${repo} --json title,body,additions,deletions,files,author`,
+        { encoding: 'utf-8', timeout: 30000 },
+      ));
+    } catch (e) {
+      return { type: 'code-review', error: `Failed to fetch PR metadata: ${e.message}` };
+    }
+    try {
+      prDiff = execSync(
+        `gh pr diff ${prNumber} --repo ${owner}/${repo}`,
+        { encoding: 'utf-8', maxBuffer: 2 * 1024 * 1024, timeout: 30000 },
+      );
+    } catch (e) {
+      return { type: 'code-review', error: `Failed to fetch PR diff: ${e.message}` };
+    }
+
+    return analyzePrReview(prInfo, prDiff);
+  } else if (input.code) {
+    return analyzeCodeSnippet(input.code, input.language || 'unknown');
+  }
+
+  return { type: 'code-review', error: 'Provide either {prUrl} or {code, language} in the input.' };
+}
+
+/** Analyze a GitHub PR diff for common issues. */
+function analyzePrReview(prInfo, diff) {
+  const files = prInfo.files || [];
+  const findings = [];
+  const diffLines = diff.split('\n');
+  let currentFile = '';
+  let addedLines = 0;
+  let removedLines = 0;
+
+  for (const line of diffLines) {
+    if (line.startsWith('diff --git')) {
+      currentFile = line.split(' b/')[1] || '';
+    } else if (line.startsWith('+') && !line.startsWith('+++')) {
+      addedLines++;
+      if (line.includes('console.log'))
+        findings.push({ severity: 'warning', file: currentFile, detail: 'console.log detected — remove debug logging' });
+      if (line.includes('TODO') || line.includes('FIXME'))
+        findings.push({ severity: 'info', file: currentFile, detail: `TODO/FIXME comment: ${line.trim().slice(0, 80)}` });
+      if (line.includes('password') || line.includes('secret') || line.includes('api_key'))
+        findings.push({ severity: 'critical', file: currentFile, detail: 'Potential secret/credential in code' });
+      if (line.match(/catch\s*\(\s*\w*\s*\)\s*\{\s*\}/))
+        findings.push({ severity: 'warning', file: currentFile, detail: 'Empty catch block — errors silently swallowed' });
+      if (line.includes('eval('))
+        findings.push({ severity: 'critical', file: currentFile, detail: 'eval() usage detected — potential security risk' });
+      if (line.length > 200)
+        findings.push({ severity: 'info', file: currentFile, detail: `Long line (${line.length} chars) — consider breaking up` });
+      if (line.includes('var '))
+        findings.push({ severity: 'info', file: currentFile, detail: 'Use let/const instead of var' });
+      if (line.match(/===?\s*null\b/) && !line.match(/!==?\s*null\b/))
+        findings.push({ severity: 'info', file: currentFile, detail: 'Null check — consider optional chaining (?.)' });
+    } else if (line.startsWith('-') && !line.startsWith('---')) {
+      removedLines++;
+    }
+  }
+
+  // Deduplicate
+  const seen = new Set();
+  const uniqueFindings = findings.filter(f => {
+    const key = f.file + '|' + f.detail;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  // File type analysis
+  const fileTypes = {};
+  for (const f of files) {
+    const ext = f.path?.split('.').pop() || 'unknown';
+    fileTypes[ext] = (fileTypes[ext] || 0) + 1;
+  }
+
+  const suggestions = [];
+  if (uniqueFindings.some(f => f.severity === 'critical'))
+    suggestions.push('Address critical findings (secrets, eval) before merging');
+  if (uniqueFindings.filter(f => f.detail.includes('console.log')).length > 2)
+    suggestions.push('Remove debug console.log statements');
+  if (addedLines > 500)
+    suggestions.push('Large PR — consider breaking into smaller, focused PRs');
+  if (files.length > 10)
+    suggestions.push('Many files changed — ensure each change is related');
+
+  return {
+    type: 'code-review',
+    summary: `Review of PR: ${prInfo.title}`,
+    author: prInfo.author?.login || 'unknown',
+    filesReviewed: files.length,
+    linesChanged: `+${prInfo.additions || addedLines} / -${prInfo.deletions || removedLines}`,
+    fileTypes,
+    findings: uniqueFindings.slice(0, 20),
+    suggestions,
+    overallAssessment: uniqueFindings.some(f => f.severity === 'critical')
+      ? 'Issues found — review critical findings before merging'
+      : uniqueFindings.length > 5
+        ? 'Several items to address — mostly minor improvements'
+        : 'Looks clean — minor suggestions only',
+  };
+}
+
+/** Analyze a code snippet for common issues. */
+function analyzeCodeSnippet(code, language) {
+  const lines = code.split('\n');
+  const findings = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.includes('console.log'))
+      findings.push({ severity: 'warning', line: i + 1, detail: 'Debug logging' });
+    if (line.includes('TODO') || line.includes('FIXME'))
+      findings.push({ severity: 'info', line: i + 1, detail: line.trim() });
+    if (line.match(/catch\s*\(\s*\w*\s*\)\s*\{\s*\}/))
+      findings.push({ severity: 'warning', line: i + 1, detail: 'Empty catch block' });
+    if (line.includes('eval('))
+      findings.push({ severity: 'critical', line: i + 1, detail: 'eval() is a security risk' });
+    if (line.includes('var '))
+      findings.push({ severity: 'info', line: i + 1, detail: 'Use let/const instead of var' });
+    if (line.includes('password') || line.includes('secret') || line.includes('api_key'))
+      findings.push({ severity: 'critical', line: i + 1, detail: 'Potential secret/credential in code' });
+    if (line.match(/===?\s*null\b/) && !line.match(/!==?\s*null\b/))
+      findings.push({ severity: 'info', line: i + 1, detail: 'Null check — consider optional chaining' });
+  }
+
+  return {
+    type: 'code-review',
+    summary: `Code review (${language}, ${lines.length} lines)`,
+    language,
+    totalLines: lines.length,
+    findings: findings.slice(0, 20),
+    overallAssessment: findings.some(f => f.severity === 'critical')
+      ? 'Critical issues found'
+      : findings.length > 3
+        ? 'Several items to review'
+        : 'Looks reasonable',
+  };
 }
 
 /** Handle a tell-joke service request with payment verification. */
@@ -1790,9 +2148,9 @@ async function cmdConnect() {
   await new Promise(() => {});
 }
 
-async function cmdRequestService(targetKey, serviceId, satsStr) {
+async function cmdRequestService(targetKey, serviceId, satsStr, inputJsonStr) {
   if (!targetKey || !serviceId) {
-    return fail('Usage: request-service <identityKey> <serviceId> [sats]');
+    return fail('Usage: request-service <identityKey> <serviceId> [sats] [inputJson]');
   }
   if (!/^0[23][0-9a-fA-F]{64}$/.test(targetKey)) {
     return fail('Target must be a compressed public key (66 hex chars, 02/03 prefix)');
@@ -1800,6 +2158,16 @@ async function cmdRequestService(targetKey, serviceId, satsStr) {
 
   const { identityKey, privKey } = loadIdentity();
   const sats = parseInt(satsStr || '5', 10);
+
+  // Parse optional input JSON
+  let inputData = null;
+  if (inputJsonStr) {
+    try {
+      inputData = JSON.parse(inputJsonStr);
+    } catch {
+      return fail('inputJson must be valid JSON');
+    }
+  }
 
   // Build the service request payload
   let paymentData = null;
@@ -1823,6 +2191,7 @@ async function cmdRequestService(targetKey, serviceId, satsStr) {
 
   const requestPayload = {
     serviceId,
+    ...(inputData ? { input: inputData } : {}),
     payment: paymentData,
     requestedAt: new Date().toISOString(),
   };
@@ -1896,7 +2265,7 @@ try {
     case 'ack':               await cmdAck(args); break;
     case 'poll':              await cmdPoll(); break;
     case 'connect':           await cmdConnect(); break;
-    case 'request-service':   await cmdRequestService(args[0], args[1], args[2]); break;
+    case 'request-service':   await cmdRequestService(args[0], args[1], args[2], args[3]); break;
 
     default:
       fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, services, advertise, remove, discover, pay, verify, accept, send, inbox, ack, poll, connect, request-service`);
