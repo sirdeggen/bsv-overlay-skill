@@ -2396,6 +2396,13 @@ async function cmdConnect() {
           const result = await processMessage(envelope.message, identityKey, privKey);
           // Output the result as a JSON line to stdout
           console.log(JSON.stringify(result));
+
+          // Also append to notification log for external consumers (cron, etc.)
+          const notifPath = path.join(OVERLAY_STATE_DIR, 'notifications.jsonl');
+          try {
+            fs.mkdirSync(OVERLAY_STATE_DIR, { recursive: true });
+            fs.appendFileSync(notifPath, JSON.stringify({ ...result, _ts: Date.now() }) + '\n');
+          } catch {}
           // Ack the message
           if (result.ack) {
             try {
