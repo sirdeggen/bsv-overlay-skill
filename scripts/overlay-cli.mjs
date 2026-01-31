@@ -403,8 +403,8 @@ async function importChangeOutput(txid, tx, changeSats, vout) {
         outputIndex: vout,
         protocol: 'wallet payment',
         paymentRemittance: {
-          derivationPrefix: 'overlay-change',
-          derivationSuffix: txid.slice(0, 16),
+          derivationPrefix: Utils.toBase64(Array.from(new TextEncoder().encode('overlay-change'))),
+          derivationSuffix: Utils.toBase64(Array.from(new TextEncoder().encode(txid.slice(0, 16)))),
           senderIdentityKey: identityKey,
         },
       }],
@@ -680,8 +680,8 @@ async function cmdImport(txidArg, voutStr) {
         outputIndex: vout,
         protocol: 'wallet payment',
         paymentRemittance: {
-          derivationPrefix: 'imported',
-          derivationSuffix: txid.slice(0, 16),
+          derivationPrefix: Utils.toBase64(Array.from(new TextEncoder().encode('imported'))),
+          derivationSuffix: Utils.toBase64(Array.from(new TextEncoder().encode(txid.slice(0, 16)))),
           senderIdentityKey: identityKey,
         },
       }],
@@ -1608,14 +1608,17 @@ async function cmdPoll() {
         try {
           const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
           const atomicBeefBytes = beef.toBinaryAtomic(paymentTxid);
+          // derivationPrefix/Suffix must be valid base64 per BRC-29
+          const derivPrefix = payment.derivationPrefix || Utils.toBase64(Array.from(new TextEncoder().encode('service-payment')));
+          const derivSuffix = payment.derivationSuffix || Utils.toBase64(Array.from(new TextEncoder().encode(paymentTxid.slice(0, 16))));
           await wallet._setup.wallet.storage.internalizeAction({
             tx: atomicBeefBytes,
             outputs: [{
               outputIndex: paymentOutputIndex,
               protocol: 'wallet payment',
               paymentRemittance: {
-                derivationPrefix: payment.derivationPrefix || 'service-payment',
-                derivationSuffix: payment.derivationSuffix || paymentTxid.slice(0, 16),
+                derivationPrefix: derivPrefix,
+                derivationSuffix: derivSuffix,
                 senderIdentityKey: msg.from,
               },
             }],
