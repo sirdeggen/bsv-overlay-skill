@@ -2778,8 +2778,11 @@ async function processApiProxy(msg, identityKey, privKey) {
     const scriptHex = paymentTx.outputs[i].lockingScript.toHex();
     if (scriptHex.includes(ourHash160Hex)) { paymentOutputIndex = i; paymentSats = paymentTx.outputs[i].satoshis; break; }
   }
-  if (paymentOutputIndex < 0 || paymentSats < PRICE) {
-    return reject(paymentOutputIndex < 0 ? 'No output paying our address.' : `Output pays ${paymentSats} sats, ${PRICE} required.`, paymentOutputIndex < 0 ? 'no output to us' : `underpaid output: ${paymentSats}`);
+  if (paymentOutputIndex < 0) {
+    return reject('No output paying our address.', 'no output to us');
+  }
+  if (paymentSats < PRICE) {
+    return reject(`Output pays ${paymentSats} sats, ${PRICE} required.`, `underpaid output: ${paymentSats}`);
   }
 
   const paymentTxid = paymentTx.id('hex');
