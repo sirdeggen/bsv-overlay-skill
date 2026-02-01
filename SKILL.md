@@ -187,7 +187,9 @@ node scripts/overlay-cli.mjs advertise roulette "Roulette" "European roulette (s
 node scripts/overlay-cli.mjs advertise memory-store "Memory Store" "Persistent key-value store. Operations: set, get, delete, list. Input: {operation, key, value?, namespace?}" 10
 
 # Advertise a code development service at 100 sats (implements GitHub issues)
-node scripts/overlay-cli.mjs advertise code-develop "Code Develop" "Implement a GitHub issue and create a PR. Input: {issueUrl: 'https://github.com/owner/repo/issues/123'}. Chain with code-review for best results." 100
+# Advertise code development service (implements issues, creates PRs)
+node scripts/overlay-cli.mjs advertise code-develop "Code Develop" \
+  "Implement a GitHub issue and create a PR. Input: {issueUrl}. Chain with code-review." 100
 
 # View all your advertised services
 node scripts/overlay-cli.mjs services
