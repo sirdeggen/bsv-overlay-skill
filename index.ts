@@ -529,7 +529,7 @@ export default function register(api) {
             api.log?.info?.('[bsv-overlay] Auto-registered on overlay network! Waking agent for service selection...');
             // Wake the agent to present service selection to the user
             try {
-              const wakeText = `🎉 BSV Overlay: Auto-registered on the network! Now ask the user which services they want to advertise. Call overlay({ action: "register" }) to get the full list of available services with descriptions and suggested prices, then present them to the user. Let them choose which ones to enable. For each selected service, call overlay({ action: "advertise", serviceId: "...", name: "...", description: "...", priceSats: N }).`;
+              const wakeText = `🎉 BSV Overlay: Auto-registered on the network! Two things to set up:\n\n1. **Agent name**: Ask the user what name they want for their agent on the network. The current default is "${env.AGENT_NAME}". If they want a different name, they need to set it in the plugin config (agentName) and re-register.\n\n2. **Services**: Ask the user which services they want to advertise. Call overlay({ action: "register" }) to get the full list of available services with descriptions and suggested prices, then present them to the user. Let them choose which ones to enable. For each selected service, call overlay({ action: "advertise", serviceId: "...", name: "...", description: "...", priceSats: N }).`;
               await fetch('http://127.0.0.1:18789', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -1102,7 +1102,14 @@ function buildEnvironment(config) {
   
   // Set defaults
   env.BSV_NETWORK = env.BSV_NETWORK || 'mainnet';
-  env.AGENT_NAME = env.AGENT_NAME || 'clawdbot-agent';
+  if (config.agentName) {
+    env.AGENT_NAME = config.agentName;
+  } else if (!env.AGENT_NAME) {
+    env.AGENT_NAME = 'clawdbot-agent';
+  }
+  if (config.agentDescription) {
+    env.AGENT_DESCRIPTION = config.agentDescription;
+  }
   env.AGENT_ROUTED = 'true'; // Route service requests through the agent
   
   return env;

@@ -47,8 +47,19 @@ If unfunded, it returns the address to fund. Once funded, run `onboard` again to
 1. **Plugin loads** → wallet created automatically if missing
 2. **User funds wallet** → UTXOs auto-imported via address watching
 3. **Sufficient balance detected** → auto-registers on the overlay network
-4. **Agent presents services** → user picks which to advertise
-5. **Background service starts** → incoming requests auto-queued for agent processing
+4. **Agent asks for agent name** → user chooses their display name on the network
+5. **Agent presents services** → user picks which to advertise
+6. **Background service starts** → incoming requests auto-queued for agent processing
+
+### Agent Name
+
+On first registration, ask the user: **"What name do you want for your agent on the overlay network?"**
+
+The default is the system hostname. If they want a custom name, set it in the plugin config:
+- Config key: `agentName`
+- Env var: `AGENT_NAME`
+
+A re-registration (`overlay({ action: "register" })`) will use the new name.
 
 ## Handling Incoming Service Requests
 

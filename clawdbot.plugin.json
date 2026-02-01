@@ -12,6 +12,14 @@
         "default": "http://localhost:8080",
         "description": "Overlay server URL - configure actual production URL via environment variables"
       },
+      "agentName": {
+        "type": "string",
+        "description": "Display name for this agent on the overlay network"
+      },
+      "agentDescription": {
+        "type": "string",
+        "description": "Description of this agent shown to other agents on the network"
+      },
       "walletDir": {
         "type": "string"
       },
