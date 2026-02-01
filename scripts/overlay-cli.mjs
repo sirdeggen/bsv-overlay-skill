@@ -1799,6 +1799,22 @@ function formatServiceResponse(serviceId, status, result) {
         details: result,
       };
     
+    case 'roulette':
+      return {
+        ...base,
+        type: 'roulette',
+        summary: result?.message || (result?.won ? `Won ${result.payout} sats!` : `Lost ${result.betAmount} sats`),
+        details: {
+          spin: result?.spin,
+          color: result?.color,
+          bet: result?.bet,
+          betAmount: result?.betAmount,
+          won: result?.won,
+          payout: result?.payout,
+          multiplier: result?.multiplier,
+        },
+      };
+    
     default:
       // Generic service response — show preview of result
       const resultPreview = result
@@ -1967,6 +1983,8 @@ async function processMessage(msg, identityKey, privKey) {
       return await processTranslate(msg, identityKey, privKey);
     } else if (serviceId === 'api-proxy') {
       return await processApiProxy(msg, identityKey, privKey);
+    } else if (serviceId === 'roulette') {
+      return await processRoulette(msg, identityKey, privKey);
     } else {
       // Unknown service — don't auto-process
       return {
@@ -3290,6 +3308,338 @@ async function proxyCryptoPrice(params) {
     volume24h: coinData[`${currency}_24h_vol`],
     provider: 'CoinGecko',
   };
+}
+
+// ---------------------------------------------------------------------------
+// Service: roulette (variable sats - gambling)
+// ---------------------------------------------------------------------------
+
+// Roulette wheel configuration (European single-zero)
+const ROULETTE_NUMBERS = [
+  0, 32, 15, 19, 4, 21, 2, 25, 17, 34, 6, 27, 13, 36, 11, 30, 8, 23, 10,
+  5, 24, 16, 33, 1, 20, 14, 31, 9, 22, 18, 29, 7, 28, 12, 35, 3, 26
+];
+const RED_NUMBERS = [1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36];
+const BLACK_NUMBERS = [2, 4, 6, 8, 10, 11, 13, 15, 17, 20, 22, 24, 26, 28, 29, 31, 33, 35];
+
+const ROULETTE_MIN_BET = 10;
+const ROULETTE_MAX_BET = 1000;
+
+async function processRoulette(msg, identityKey, privKey) {
+  const payment = msg.payload?.payment;
+  const input = msg.payload?.input || msg.payload;
+  const bet = input?.bet;
+  const betAmount = payment?.satoshis || 0;
+
+  // Helper to send rejection
+  async function reject(reason, shortReason) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'roulette',
+      status: 'rejected',
+      reason,
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    }, 15000);
+    return { id: msg.id, type: 'service-request', serviceId: 'roulette', action: 'rejected', reason: shortReason, from: msg.from, ack: true };
+  }
+
+  // Validate bet type
+  const validBets = ['red', 'black', 'odd', 'even', 'low', 'high', '1st12', '2nd12', '3rd12'];
+  const isNumberBet = typeof bet === 'number' && bet >= 0 && bet <= 36;
+  const isNamedBet = typeof bet === 'string' && validBets.includes(bet.toLowerCase());
+  
+  if (!isNumberBet && !isNamedBet) {
+    return reject(
+      `Invalid bet. Options: single number (0-36), or: ${validBets.join(', ')}. Example: {bet: "red"} or {bet: 17}`,
+      'invalid bet'
+    );
+  }
+
+  // ── Payment verification ──
+  if (!payment || !payment.beef || !payment.satoshis) {
+    return reject(`No payment included. Place your bet (${ROULETTE_MIN_BET}-${ROULETTE_MAX_BET} sats) as the payment amount.`, 'no payment');
+  }
+  if (betAmount < ROULETTE_MIN_BET) {
+    return reject(`Minimum bet is ${ROULETTE_MIN_BET} sats. You sent ${betAmount}.`, `bet too low: ${betAmount}`);
+  }
+  if (betAmount > ROULETTE_MAX_BET) {
+    return reject(`Maximum bet is ${ROULETTE_MAX_BET} sats. You sent ${betAmount}.`, `bet too high: ${betAmount}`);
+  }
+
+  // ── Validate BEEF ──
+  let beefBytes;
+  try { beefBytes = Uint8Array.from(atob(payment.beef), c => c.charCodeAt(0)); } catch { beefBytes = null; }
+  let paymentTx = null;
+  let isAtomicBeef = false;
+  if (beefBytes && beefBytes.length > 20) {
+    try { paymentTx = Transaction.fromAtomicBEEF(Array.from(beefBytes)); isAtomicBeef = true; } catch { /* expected */ }
+    if (!paymentTx) try { const b = Beef.fromBinary(Array.from(beefBytes)); paymentTx = b.txs?.find(t => t.tx)?.tx; } catch { /* expected */ }
+  }
+  if (!paymentTx) {
+    return reject('Invalid payment BEEF.', 'invalid BEEF');
+  }
+
+  // ── Find our output & accept payment ──
+  const walletIdentityPath = path.join(WALLET_DIR, 'wallet-identity.json');
+  let walletIdentity;
+  try {
+    walletIdentity = JSON.parse(fs.readFileSync(walletIdentityPath, 'utf-8'));
+  } catch (parseErr) {
+    return reject(`Failed to load wallet identity: ${parseErr.message}`, 'wallet error');
+  }
+  const ourPrivKey = PrivateKey.fromHex(walletIdentity.rootKeyHex);
+  const ourPubKey = ourPrivKey.toPublicKey();
+  const ourHash160 = Hash.hash160(ourPubKey.encode(true));
+  const ourHash160Hex = Array.from(ourHash160).map(b => b.toString(16).padStart(2, '0')).join('');
+
+  let paymentOutputIndex = -1;
+  let paymentSats = 0;
+  for (let i = 0; i < paymentTx.outputs.length; i++) {
+    const scriptHex = paymentTx.outputs[i].lockingScript.toHex();
+    if (scriptHex.includes(ourHash160Hex)) { paymentOutputIndex = i; paymentSats = paymentTx.outputs[i].satoshis; break; }
+  }
+  if (paymentOutputIndex < 0) {
+    return reject('No output paying our address.', 'no output to us');
+  }
+  if (paymentSats < ROULETTE_MIN_BET) {
+    return reject(`Output pays ${paymentSats} sats, minimum ${ROULETTE_MIN_BET} required.`, `underpaid: ${paymentSats}`);
+  }
+
+  const paymentTxid = paymentTx.id('hex');
+  const actualBetAmount = Math.min(paymentSats, ROULETTE_MAX_BET);
+
+  // Accept into wallet
+  let walletAccepted = false;
+  let acceptError = null;
+  const derivPrefix = Utils.toBase64(Array.from(new TextEncoder().encode('roulette')));
+  const derivSuffix = Utils.toBase64(Array.from(new TextEncoder().encode(paymentTxid.slice(0, 16))));
+  const internalizeArgs = {
+    outputs: [{
+      outputIndex: paymentOutputIndex,
+      protocol: 'wallet payment',
+      paymentRemittance: { derivationPrefix: derivPrefix, derivationSuffix: derivSuffix, senderIdentityKey: msg.from },
+    }],
+    description: `Roulette bet from ${msg.from.slice(0, 12)}...`,
+  };
+
+  try {
+    const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
+    const atomicBytes = isAtomicBeef ? new Uint8Array(beefBytes) : new Uint8Array(Beef.fromBinary(Array.from(beefBytes)).toBinaryAtomic(paymentTxid));
+    await wallet._setup.wallet.storage.internalizeAction({ tx: atomicBytes, ...internalizeArgs });
+    await wallet.destroy();
+    walletAccepted = true;
+  } catch (err1) {
+    // Fallback: rebuild from WoC
+    try {
+      const txChain = [];
+      let curTx = paymentTx;
+      let curTxid = paymentTxid;
+      txChain.push({ tx: curTx, txid: curTxid });
+      for (let depth = 0; depth < 10; depth++) {
+        const srcTxid = curTx.inputs[0].sourceTXID;
+        const srcHexResp = await wocFetch(`/tx/${srcTxid}/hex`);
+        if (!srcHexResp.ok) throw new Error(`WoC ${srcHexResp.status}`);
+        const srcTx = Transaction.fromHex(await srcHexResp.text());
+        const srcInfoResp = await wocFetch(`/tx/${srcTxid}`);
+        if (!srcInfoResp.ok) throw new Error(`WoC ${srcInfoResp.status}`);
+        const srcInfo = await srcInfoResp.json();
+        if (srcInfo.confirmations > 0 && srcInfo.blockheight) {
+          const proofResp = await wocFetch(`/tx/${srcTxid}/proof/tsc`);
+          if (proofResp.ok) {
+            const pd = await proofResp.json();
+            if (Array.isArray(pd) && pd.length > 0) srcTx.merklePath = buildMerklePathFromTSC(srcTxid, pd[0].index, pd[0].nodes, srcInfo.blockheight);
+          }
+          txChain.push({ tx: srcTx, txid: srcTxid });
+          break;
+        }
+        txChain.push({ tx: srcTx, txid: srcTxid });
+        curTx = srcTx;
+        curTxid = srcTxid;
+      }
+      const freshBeef = new Beef();
+      for (let i = txChain.length - 1; i >= 0; i--) freshBeef.mergeTransaction(txChain[i].tx);
+      const freshAtomicBytes = new Uint8Array(freshBeef.toBinaryAtomic(paymentTxid));
+      const wallet2 = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
+      await wallet2._setup.wallet.storage.internalizeAction({ tx: freshAtomicBytes, ...internalizeArgs });
+      await wallet2.destroy();
+      walletAccepted = true;
+    } catch (err2) {
+      acceptError = `Attempt 1: ${err1.message} | Attempt 2: ${err2.message}`;
+    }
+  }
+
+  // ── SPIN THE WHEEL ──
+  const spinResult = spinRouletteWheel();
+  const normalizedBet = isNumberBet ? bet : bet.toLowerCase();
+  const { won, payout, multiplier } = evaluateRouletteBet(normalizedBet, spinResult, actualBetAmount);
+
+  // Determine color of result
+  const resultColor = spinResult === 0 ? 'green' : (RED_NUMBERS.includes(spinResult) ? 'red' : 'black');
+
+  // ── If player won, pay them back ──
+  let winningsPaid = false;
+  let winningsPayment = null;
+  let payoutError = null;
+
+  if (won && payout > 0) {
+    try {
+      winningsPayment = await buildDirectPayment(msg.from, payout, `Roulette winnings: ${normalizedBet} on ${spinResult}`);
+      winningsPaid = true;
+    } catch (payErr) {
+      payoutError = `Failed to send winnings: ${payErr instanceof Error ? payErr.message : String(payErr)}`;
+    }
+  }
+
+  // Build result
+  const gameResult = {
+    spin: spinResult,
+    color: resultColor,
+    bet: normalizedBet,
+    betAmount: actualBetAmount,
+    won,
+    multiplier: won ? multiplier : 0,
+    payout: won ? payout : 0,
+    winningsPaid,
+    ...(winningsPayment ? { payoutTxid: winningsPayment.txid } : {}),
+    ...(payoutError ? { payoutError } : {}),
+    message: won
+      ? `🎰 ${spinResult} ${resultColor.toUpperCase()}! You WIN ${payout} sats (${multiplier}x)!`
+      : `🎰 ${spinResult} ${resultColor.toUpperCase()}. You lose ${actualBetAmount} sats. Better luck next time!`,
+  };
+
+  // Send response
+  const responsePayload = {
+    requestId: msg.id,
+    serviceId: 'roulette',
+    status: 'fulfilled',
+    result: gameResult,
+    paymentAccepted: true,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    ...(acceptError ? { walletError: acceptError } : {}),
+  };
+  const respSig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
+  await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: identityKey, to: msg.from, type: 'service-response',
+      payload: responsePayload, signature: respSig,
+    }),
+  }, 15000);
+
+  return {
+    id: msg.id,
+    type: 'service-request',
+    serviceId: 'roulette',
+    action: 'fulfilled',
+    result: gameResult,
+    paymentAccepted: true,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    direction: 'incoming-request',
+    formatted: {
+      type: 'roulette',
+      summary: gameResult.message,
+      earnings: won ? -payout : actualBetAmount, // negative if we paid out
+    },
+    ...(acceptError ? { walletError: acceptError } : {}),
+    from: msg.from,
+    ack: true,
+  };
+}
+
+/**
+ * Spin the roulette wheel - returns a number 0-36
+ */
+function spinRouletteWheel() {
+  // Use crypto.getRandomValues for fairness
+  const randomBytes = new Uint8Array(4);
+  crypto.getRandomValues(randomBytes);
+  const randomInt = (randomBytes[0] << 24) | (randomBytes[1] << 16) | (randomBytes[2] << 8) | randomBytes[3];
+  const positiveInt = randomInt >>> 0; // Convert to unsigned
+  return positiveInt % 37; // 0-36
+}
+
+/**
+ * Evaluate a roulette bet against the spin result
+ * Returns { won: boolean, payout: number, multiplier: number }
+ */
+function evaluateRouletteBet(bet, spinResult, betAmount) {
+  // Single number bet (35:1)
+  if (typeof bet === 'number') {
+    if (bet === spinResult) {
+      return { won: true, payout: betAmount * 36, multiplier: 36 }; // 35:1 + original bet
+    }
+    return { won: false, payout: 0, multiplier: 0 };
+  }
+
+  // Named bets
+  switch (bet) {
+    case 'red':
+      if (RED_NUMBERS.includes(spinResult)) {
+        return { won: true, payout: betAmount * 2, multiplier: 2 };
+      }
+      return { won: false, payout: 0, multiplier: 0 };
+
+    case 'black':
+      if (BLACK_NUMBERS.includes(spinResult)) {
+        return { won: true, payout: betAmount * 2, multiplier: 2 };
+      }
+      return { won: false, payout: 0, multiplier: 0 };
+
+    case 'odd':
+      if (spinResult > 0 && spinResult % 2 === 1) {
+        return { won: true, payout: betAmount * 2, multiplier: 2 };
+      }
+      return { won: false, payout: 0, multiplier: 0 };
+
+    case 'even':
+      if (spinResult > 0 && spinResult % 2 === 0) {
+        return { won: true, payout: betAmount * 2, multiplier: 2 };
+      }
+      return { won: false, payout: 0, multiplier: 0 };
+
+    case 'low': // 1-18
+      if (spinResult >= 1 && spinResult <= 18) {
+        return { won: true, payout: betAmount * 2, multiplier: 2 };
+      }
+      return { won: false, payout: 0, multiplier: 0 };
+
+    case 'high': // 19-36
+      if (spinResult >= 19 && spinResult <= 36) {
+        return { won: true, payout: betAmount * 2, multiplier: 2 };
+      }
+      return { won: false, payout: 0, multiplier: 0 };
+
+    case '1st12': // 1-12
+      if (spinResult >= 1 && spinResult <= 12) {
+        return { won: true, payout: betAmount * 3, multiplier: 3 };
+      }
+      return { won: false, payout: 0, multiplier: 0 };
+
+    case '2nd12': // 13-24
+      if (spinResult >= 13 && spinResult <= 24) {
+        return { won: true, payout: betAmount * 3, multiplier: 3 };
+      }
+      return { won: false, payout: 0, multiplier: 0 };
+
+    case '3rd12': // 25-36
+      if (spinResult >= 25 && spinResult <= 36) {
+        return { won: true, payout: betAmount * 3, multiplier: 3 };
+      }
+      return { won: false, payout: 0, multiplier: 0 };
+
+    default:
+      return { won: false, payout: 0, multiplier: 0 };
+  }
 }
 
 /** Analyze a GitHub PR diff for common issues. */

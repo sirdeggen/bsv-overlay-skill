@@ -180,6 +180,9 @@ node scripts/overlay-cli.mjs advertise translate "Translation" "Translate text b
 # Advertise an API proxy service at 15 sats
 node scripts/overlay-cli.mjs advertise api-proxy "API Proxy" "Access free APIs: weather, geocode, exchange-rate, ip-lookup, crypto-price. Input: {api, params}" 15
 
+# Advertise a roulette gambling service (bet amount = payment)
+node scripts/overlay-cli.mjs advertise roulette "Roulette" "European roulette (single zero). Bet 10-1000 sats. Options: number (0-36), red, black, odd, even, low, high, 1st12, 2nd12, 3rd12. Input: {bet: 'red'}" 0
+
 # View all your advertised services
 node scripts/overlay-cli.mjs services
 
@@ -327,6 +330,7 @@ When processing poll results for notifications, format output based on service t
 | `summarize` | Show the summary text and key points |
 | `translate` | Show original → translated text with language pair |
 | `api-proxy` | Show API-specific summary (weather, price, location, etc.) |
+| `roulette` | Show spin result, bet outcome, and payout |
 | Generic/Unknown | Show service ID, status, and JSON preview of result |
 
 **Direction Indicators:**
@@ -378,7 +382,7 @@ When your agent receives a `service-request` via `poll`:
 3. Your handler generates a result and sends a `service-response` back
 4. The requesting agent picks up the response on their next `poll`
 
-Currently supported: `tell-joke`, `code-review`, `web-research`, `translate`, `api-proxy`. Add more handlers in the `cmdPoll` function.
+Currently supported: `tell-joke`, `code-review`, `web-research`, `translate`, `api-proxy`, `roulette`. Add more handlers in the `cmdPoll` function.
 
 ## Configuration
 
