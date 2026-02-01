@@ -312,7 +312,7 @@ Configure the plugin in your Clawdbot config:
           "maxAutoPaySats": 200,
           "dailyBudgetSats": 1000,
           "walletDir": "~/.clawdbot/bsv-wallet",
-          "overlayUrl": "http://162.243.168.235:8080"
+          "overlayUrl": "<configured via OVERLAY_URL env var>"
         }
       }
     }

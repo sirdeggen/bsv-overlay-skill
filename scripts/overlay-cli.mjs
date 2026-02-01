@@ -2196,7 +2196,12 @@ async function queueForAgent(msg, identityKey, privKey, serviceId) {
   const input = msg.payload?.input || msg.payload;
   
   // Verify and accept payment
-  const walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  let walletIdentity;
+  try {
+    walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  } catch (error) {
+    throw new Error(`Failed to load wallet identity: ${error.message}`);
+  }
   const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
   
   // Find the service price (from local services registry)
@@ -2209,7 +2214,7 @@ async function queueForAgent(msg, identityKey, privKey, serviceId) {
     // Send rejection
     const rejectPayload = { requestId: msg.id, serviceId, status: 'rejected', reason: `Payment rejected: ${payResult.error}` };
     const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
-    await fetch(`${OVERLAY_URL}/relay/send`, {
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
@@ -4522,7 +4527,9 @@ try {
     case 'respond-service':   await cmdRespondService(args[0], args[1], args[2], args.slice(3).join(' ')); break;
 
     default:
-      fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, services, advertise, readvertise, remove, discover, pay, verify, accept, send, inbox, ack, poll, connect, request-service, research-queue, research-respond, service-queue, respond-service`);
+      fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, ` +
+           `services, advertise, readvertise, remove, discover, pay, verify, accept, send, inbox, ack, poll, connect, ` +
+           `request-service, research-queue, research-respond, service-queue, respond-service`);
   }
 } catch (err) {
   fail(err instanceof Error ? err.message : String(err));

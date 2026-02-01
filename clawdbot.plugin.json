@@ -9,7 +9,8 @@
     "properties": {
       "overlayUrl": {
         "type": "string",
-        "default": "http://162.243.168.235:8080"
+        "default": "http://localhost:8080",
+        "description": "Overlay server URL - configure actual production URL via environment variables"
       },
       "walletDir": {
         "type": "string"

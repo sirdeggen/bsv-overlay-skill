@@ -1,4 +1,4 @@
-import { execFile, spawn } from 'child_process';
+import { execFile, spawn, ChildProcess } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -10,7 +10,7 @@ const __dirname = path.dirname(__filename);
 const execFileAsync = promisify(execFile);
 
 // Track background process for proper lifecycle management
-let backgroundProcess: any = null;
+let backgroundProcess: ChildProcess | null = null;
 let serviceRunning = false;
 
 // Auto-import tracking
@@ -36,7 +36,9 @@ function loadDailySpending(walletDir: string): DailySpending {
   try {
     const data = JSON.parse(fs.readFileSync(budgetPath, 'utf-8'));
     if (data.date === today) return data;
-  } catch {}
+  } catch {
+    // Ignore parse errors - return fresh daily spending for corrupted/missing file
+  }
   return { date: today, totalSats: 0, transactions: [] };
 }
 
@@ -74,8 +76,11 @@ async function startAutoImport(env, cliPath, logger) {
     autoImportInterval = setInterval(async () => {
       try {
         const network = env.BSV_NETWORK === 'testnet' ? 'test' : 'main';
-        const resp = await fetch(`https://api.whatsonchain.com/v1/bsv/${network}/address/${address}/unspent`);
-        if (!resp.ok) return;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000);
+        try {
+          const resp = await fetch(`https://api.whatsonchain.com/v1/bsv/${network}/address/${address}/unspent`, { signal: controller.signal });
+          if (!resp.ok) return;
         const utxos = await resp.json();
         
         for (const utxo of utxos) {
@@ -113,6 +118,8 @@ async function startAutoImport(env, cliPath, logger) {
         }
       } catch (err) {
         // WoC API error — just skip this cycle
+      } finally {
+        clearTimeout(timeout);
       }
     }, 60000); // Check every 60 seconds
   } catch (err) {
@@ -147,7 +154,7 @@ function startBackgroundService(env, cliPath, logger) {
       for (const line of lines) {
         try {
           const event = JSON.parse(line);
-          logger?.info?.(`[bsv-overlay] ${event.event || event.type || 'message'}:`, JSON.stringify(event).slice(0, 200));
+          logger?.debug?.(`[bsv-overlay] ${event.event || event.type || 'message'}:`, JSON.stringify(event).slice(0, 200));
         } catch {}
       }
     });
