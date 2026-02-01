@@ -1635,6 +1635,30 @@ function formatServiceResponse(serviceId, status, result) {
         },
       };
     
+    case 'api-proxy':
+      const apiName = result?.api || 'unknown';
+      let apiSummary = result?.error ? `API proxy (${apiName}) failed: ${result.error}` : `API proxy (${apiName}) completed`;
+      // Add specific summary based on API type
+      if (!result?.error) {
+        if (apiName === 'weather' && result?.temperature) {
+          apiSummary = `Weather: ${result.location} — ${result.temperature.celsius}°C, ${result.condition}`;
+        } else if (apiName === 'exchange-rate' && result?.rate) {
+          apiSummary = `Exchange: ${result.amount} ${result.from} = ${result.converted} ${result.to}`;
+        } else if (apiName === 'crypto-price' && result?.price) {
+          apiSummary = `${result.coin}: ${result.price} ${result.currency} (${result.change24h > 0 ? '+' : ''}${result.change24h?.toFixed(2)}%)`;
+        } else if (apiName === 'geocode' && result?.displayName) {
+          apiSummary = `Geocode: ${result.displayName?.slice(0, 80)}`;
+        } else if (apiName === 'ip-lookup' && result?.ip) {
+          apiSummary = `IP: ${result.ip} — ${result.city}, ${result.country}`;
+        }
+      }
+      return {
+        ...base,
+        type: 'api-proxy',
+        summary: apiSummary,
+        details: result,
+      };
+    
     default:
       // Generic service response — show preview of result
       const resultPreview = result
@@ -1801,6 +1825,8 @@ async function processMessage(msg, identityKey, privKey) {
       return await processWebResearch(msg, identityKey, privKey);
     } else if (serviceId === 'translate') {
       return await processTranslate(msg, identityKey, privKey);
+    } else if (serviceId === 'api-proxy') {
+      return await processApiProxy(msg, identityKey, privKey);
     } else {
       // Unknown service — don't auto-process
       return {
@@ -2670,6 +2696,457 @@ async function performTranslation(text, sourceLang, targetLang) {
       to: to,
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Service: api-proxy (15 sats)
+// ---------------------------------------------------------------------------
+
+async function processApiProxy(msg, identityKey, privKey) {
+  const PRICE = 15;
+  const payment = msg.payload?.payment;
+  const input = msg.payload?.input || msg.payload;
+  const api = input?.api?.toLowerCase();
+  const params = input?.params || input;
+
+  // Helper to send rejection
+  async function reject(reason, shortReason) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'api-proxy',
+      status: 'rejected',
+      reason,
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    }, 15000);
+    return { id: msg.id, type: 'service-request', serviceId: 'api-proxy', action: 'rejected', reason: shortReason, from: msg.from, ack: true };
+  }
+
+  // Supported APIs
+  const SUPPORTED_APIS = ['weather', 'geocode', 'exchange-rate', 'ip-lookup', 'crypto-price'];
+
+  // Validate input
+  if (!api || typeof api !== 'string') {
+    return reject(`Missing API name. Supported: ${SUPPORTED_APIS.join(', ')}. Send {input: {api: "weather", params: {location: "NYC"}}}`, 'no api');
+  }
+  if (!SUPPORTED_APIS.includes(api)) {
+    return reject(`Unsupported API: ${api}. Supported: ${SUPPORTED_APIS.join(', ')}`, `unsupported api: ${api}`);
+  }
+
+  // ── Payment verification ──
+  if (!payment || !payment.beef || !payment.satoshis) {
+    return reject(`No payment included. API proxy costs ${PRICE} sats.`, 'no payment');
+  }
+  if (payment.satoshis < PRICE) {
+    return reject(`Insufficient payment: ${payment.satoshis} sats sent, ${PRICE} required.`, `underpaid: ${payment.satoshis} < ${PRICE}`);
+  }
+
+  // ── Validate BEEF ──
+  let beefBytes;
+  try { beefBytes = Uint8Array.from(atob(payment.beef), c => c.charCodeAt(0)); } catch { beefBytes = null; }
+  let paymentTx = null;
+  let isAtomicBeef = false;
+  if (beefBytes && beefBytes.length > 20) {
+    // Try AtomicBEEF first, then regular BEEF — empty catches are intentional as we try both formats
+    try { paymentTx = Transaction.fromAtomicBEEF(Array.from(beefBytes)); isAtomicBeef = true; } catch { /* expected if not AtomicBEEF */ }
+    if (!paymentTx) try { const b = Beef.fromBinary(Array.from(beefBytes)); paymentTx = b.txs?.find(t => t.tx)?.tx; } catch { /* expected if malformed */ }
+  }
+  if (!paymentTx) {
+    return reject('Invalid payment BEEF.', 'invalid BEEF');
+  }
+
+  // ── Find our output & accept payment ──
+  const walletIdentityPath = path.join(WALLET_DIR, 'wallet-identity.json');
+  let walletIdentity;
+  try {
+    walletIdentity = JSON.parse(fs.readFileSync(walletIdentityPath, 'utf-8'));
+  } catch (parseErr) {
+    return reject(`Failed to load wallet identity: ${parseErr.message}`, 'wallet error');
+  }
+  const ourPrivKey = PrivateKey.fromHex(walletIdentity.rootKeyHex);
+  const ourPubKey = ourPrivKey.toPublicKey();
+  const ourHash160 = Hash.hash160(ourPubKey.encode(true));
+  const ourHash160Hex = Array.from(ourHash160).map(b => b.toString(16).padStart(2, '0')).join('');
+
+  let paymentOutputIndex = -1;
+  let paymentSats = 0;
+  for (let i = 0; i < paymentTx.outputs.length; i++) {
+    const scriptHex = paymentTx.outputs[i].lockingScript.toHex();
+    if (scriptHex.includes(ourHash160Hex)) { paymentOutputIndex = i; paymentSats = paymentTx.outputs[i].satoshis; break; }
+  }
+  if (paymentOutputIndex < 0 || paymentSats < PRICE) {
+    return reject(paymentOutputIndex < 0 ? 'No output paying our address.' : `Output pays ${paymentSats} sats, ${PRICE} required.`, paymentOutputIndex < 0 ? 'no output to us' : `underpaid output: ${paymentSats}`);
+  }
+
+  const paymentTxid = paymentTx.id('hex');
+
+  // Accept into wallet
+  let walletAccepted = false;
+  let acceptError = null;
+  const derivPrefix = Utils.toBase64(Array.from(new TextEncoder().encode('api-proxy')));
+  const derivSuffix = Utils.toBase64(Array.from(new TextEncoder().encode(paymentTxid.slice(0, 16))));
+  const internalizeArgs = {
+    outputs: [{
+      outputIndex: paymentOutputIndex,
+      protocol: 'wallet payment',
+      paymentRemittance: { derivationPrefix: derivPrefix, derivationSuffix: derivSuffix, senderIdentityKey: msg.from },
+    }],
+    description: `API proxy payment from ${msg.from.slice(0, 12)}...`,
+  };
+
+  try {
+    const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
+    const atomicBytes = isAtomicBeef ? new Uint8Array(beefBytes) : new Uint8Array(Beef.fromBinary(Array.from(beefBytes)).toBinaryAtomic(paymentTxid));
+    await wallet._setup.wallet.storage.internalizeAction({ tx: atomicBytes, ...internalizeArgs });
+    await wallet.destroy();
+    walletAccepted = true;
+  } catch (err1) {
+    // Fallback: rebuild from WoC
+    try {
+      const txChain = [];
+      let curTx = paymentTx;
+      let curTxid = paymentTxid;
+      txChain.push({ tx: curTx, txid: curTxid });
+      for (let depth = 0; depth < 10; depth++) {
+        const srcTxid = curTx.inputs[0].sourceTXID;
+        const srcHexResp = await wocFetch(`/tx/${srcTxid}/hex`);
+        if (!srcHexResp.ok) throw new Error(`WoC ${srcHexResp.status}`);
+        const srcTx = Transaction.fromHex(await srcHexResp.text());
+        const srcInfoResp = await wocFetch(`/tx/${srcTxid}`);
+        if (!srcInfoResp.ok) throw new Error(`WoC ${srcInfoResp.status}`);
+        const srcInfo = await srcInfoResp.json();
+        if (srcInfo.confirmations > 0 && srcInfo.blockheight) {
+          const proofResp = await wocFetch(`/tx/${srcTxid}/proof/tsc`);
+          if (proofResp.ok) {
+            const pd = await proofResp.json();
+            if (Array.isArray(pd) && pd.length > 0) srcTx.merklePath = buildMerklePathFromTSC(srcTxid, pd[0].index, pd[0].nodes, srcInfo.blockheight);
+          }
+          txChain.push({ tx: srcTx, txid: srcTxid });
+          break;
+        }
+        txChain.push({ tx: srcTx, txid: srcTxid });
+        curTx = srcTx;
+        curTxid = srcTxid;
+      }
+      const freshBeef = new Beef();
+      for (let i = txChain.length - 1; i >= 0; i--) freshBeef.mergeTransaction(txChain[i].tx);
+      const freshAtomicBytes = new Uint8Array(freshBeef.toBinaryAtomic(paymentTxid));
+      const wallet2 = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
+      await wallet2._setup.wallet.storage.internalizeAction({ tx: freshAtomicBytes, ...internalizeArgs });
+      await wallet2.destroy();
+      walletAccepted = true;
+    } catch (err2) {
+      acceptError = `Attempt 1: ${err1.message} | Attempt 2: ${err2.message}`;
+    }
+  }
+
+  // ── Execute the API proxy request ──
+  let apiResult;
+  try {
+    apiResult = await executeApiProxy(api, params);
+  } catch (err) {
+    apiResult = { error: `API call failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+
+  // Send response
+  const responsePayload = {
+    requestId: msg.id,
+    serviceId: 'api-proxy',
+    status: apiResult.error ? 'partial' : 'fulfilled',
+    result: apiResult,
+    paymentAccepted: true,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    ...(acceptError ? { walletError: acceptError } : {}),
+  };
+  const respSig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
+  await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: identityKey, to: msg.from, type: 'service-response',
+      payload: responsePayload, signature: respSig,
+    }),
+  }, 15000);
+
+  return {
+    id: msg.id,
+    type: 'service-request',
+    serviceId: 'api-proxy',
+    action: apiResult.error ? 'partial' : 'fulfilled',
+    api,
+    result: apiResult,
+    paymentAccepted: true,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    direction: 'incoming-request',
+    formatted: {
+      type: 'api-proxy',
+      summary: apiResult.error
+        ? `API proxy (${api}) failed: ${apiResult.error}`
+        : `API proxy (${api}) completed successfully`,
+      earnings: paymentSats,
+    },
+    ...(acceptError ? { walletError: acceptError } : {}),
+    from: msg.from,
+    ack: true,
+  };
+}
+
+/**
+ * Execute an API proxy request.
+ * Supports: weather, geocode, exchange-rate, ip-lookup, crypto-price
+ */
+async function executeApiProxy(api, params) {
+  switch (api) {
+    case 'weather':
+      return await proxyWeather(params);
+    case 'geocode':
+      return await proxyGeocode(params);
+    case 'exchange-rate':
+      return await proxyExchangeRate(params);
+    case 'ip-lookup':
+      return await proxyIpLookup(params);
+    case 'crypto-price':
+      return await proxyCryptoPrice(params);
+    default:
+      return { error: `Unknown API: ${api}` };
+  }
+}
+
+/**
+ * Weather API proxy using wttr.in (free, no key required)
+ * Input: { location: "NYC" } or { location: "London" } or { lat, lon }
+ */
+async function proxyWeather(params) {
+  const location = params?.location || params?.city || params?.q;
+  if (!location) {
+    return { error: 'Missing location. Provide {location: "city name"} or {lat, lon}' };
+  }
+
+  const url = `https://wttr.in/${encodeURIComponent(location)}?format=j1`;
+  const resp = await fetchWithTimeout(url, {
+    headers: { 'User-Agent': 'BSV-Overlay-Proxy/1.0' }
+  }, 10000);
+
+  if (!resp.ok) {
+    return { error: `Weather API returned ${resp.status}` };
+  }
+
+  const data = await resp.json();
+  const current = data.current_condition?.[0];
+  const area = data.nearest_area?.[0];
+
+  return {
+    api: 'weather',
+    location: area?.areaName?.[0]?.value || location,
+    country: area?.country?.[0]?.value,
+    temperature: {
+      celsius: parseInt(current?.temp_C) || null,
+      fahrenheit: parseInt(current?.temp_F) || null,
+    },
+    feelsLike: {
+      celsius: parseInt(current?.FeelsLikeC) || null,
+      fahrenheit: parseInt(current?.FeelsLikeF) || null,
+    },
+    condition: current?.weatherDesc?.[0]?.value,
+    humidity: `${current?.humidity}%`,
+    windSpeed: {
+      kmh: parseInt(current?.windspeedKmph) || null,
+      mph: parseInt(current?.windspeedMiles) || null,
+    },
+    windDirection: current?.winddir16Point,
+    visibility: `${current?.visibility} km`,
+    uvIndex: current?.uvIndex,
+    observationTime: current?.observation_time,
+    provider: 'wttr.in',
+  };
+}
+
+/**
+ * Geocode API proxy using Nominatim/OpenStreetMap (free, no key required)
+ * Input: { address: "1600 Pennsylvania Ave, Washington DC" } for forward geocoding
+ *        { lat: 38.8977, lon: -77.0365 } for reverse geocoding
+ */
+async function proxyGeocode(params) {
+  const address = params?.address || params?.q || params?.query;
+  const lat = params?.lat || params?.latitude;
+  const lon = params?.lon || params?.lng || params?.longitude;
+
+  let url;
+  let mode;
+  if (address) {
+    url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1&addressdetails=1`;
+    mode = 'forward';
+  } else if (lat && lon) {
+    url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&addressdetails=1`;
+    mode = 'reverse';
+  } else {
+    return { error: 'Provide {address: "..."} for forward geocoding or {lat, lon} for reverse geocoding' };
+  }
+
+  const resp = await fetchWithTimeout(url, {
+    headers: { 'User-Agent': 'BSV-Overlay-Proxy/1.0' }
+  }, 10000);
+
+  if (!resp.ok) {
+    return { error: `Geocode API returned ${resp.status}` };
+  }
+
+  const data = await resp.json();
+  const result = Array.isArray(data) ? data[0] : data;
+
+  if (!result || (Array.isArray(data) && data.length === 0)) {
+    return { error: 'No results found', query: address || `${lat},${lon}` };
+  }
+
+  return {
+    api: 'geocode',
+    mode,
+    query: address || `${lat},${lon}`,
+    lat: parseFloat(result.lat),
+    lon: parseFloat(result.lon),
+    displayName: result.display_name,
+    address: result.address ? {
+      houseNumber: result.address.house_number,
+      road: result.address.road,
+      city: result.address.city || result.address.town || result.address.village,
+      state: result.address.state,
+      postcode: result.address.postcode,
+      country: result.address.country,
+      countryCode: result.address.country_code?.toUpperCase(),
+    } : null,
+    boundingBox: result.boundingbox,
+    placeId: result.place_id,
+    osmType: result.osm_type,
+    provider: 'Nominatim/OpenStreetMap',
+  };
+}
+
+/**
+ * Exchange rate API proxy using exchangerate-api.com (free tier)
+ * Input: { from: "USD", to: "EUR" } or { from: "USD", to: "EUR", amount: 100 }
+ */
+async function proxyExchangeRate(params) {
+  const from = (params?.from || params?.base || 'USD').toUpperCase();
+  const to = (params?.to || params?.target || 'EUR').toUpperCase();
+  const amount = parseFloat(params?.amount) || 1;
+
+  // Use open.er-api.com (free, no key required)
+  const url = `https://open.er-api.com/v6/latest/${from}`;
+  const resp = await fetchWithTimeout(url, {}, 10000);
+
+  if (!resp.ok) {
+    return { error: `Exchange rate API returned ${resp.status}` };
+  }
+
+  const data = await resp.json();
+  if (data.result !== 'success') {
+    return { error: data.error || 'Exchange rate lookup failed' };
+  }
+
+  const rate = data.rates?.[to];
+  if (!rate) {
+    return { error: `Currency not found: ${to}`, availableCurrencies: Object.keys(data.rates || {}).slice(0, 20) };
+  }
+
+  return {
+    api: 'exchange-rate',
+    from,
+    to,
+    rate,
+    amount,
+    converted: Math.round(amount * rate * 100) / 100,
+    lastUpdate: data.time_last_update_utc,
+    provider: 'open.er-api.com',
+  };
+}
+
+/**
+ * IP lookup API proxy using ip-api.com (free, no key required)
+ * Input: { ip: "8.8.8.8" } or {} for own IP
+ */
+async function proxyIpLookup(params) {
+  const ip = params?.ip || params?.address || '';
+  const url = ip ? `http://ip-api.com/json/${ip}` : 'http://ip-api.com/json/';
+
+  const resp = await fetchWithTimeout(url, {}, 10000);
+
+  if (!resp.ok) {
+    return { error: `IP lookup API returned ${resp.status}` };
+  }
+
+  const data = await resp.json();
+  if (data.status === 'fail') {
+    return { error: data.message || 'IP lookup failed', query: ip };
+  }
+
+  return {
+    api: 'ip-lookup',
+    ip: data.query,
+    country: data.country,
+    countryCode: data.countryCode,
+    region: data.regionName,
+    regionCode: data.region,
+    city: data.city,
+    zip: data.zip,
+    lat: data.lat,
+    lon: data.lon,
+    timezone: data.timezone,
+    isp: data.isp,
+    org: data.org,
+    as: data.as,
+    provider: 'ip-api.com',
+  };
+}
+
+/**
+ * Crypto price API proxy using CoinGecko (free, no key required)
+ * Input: { coin: "bitcoin" } or { coin: "ethereum", currency: "eur" }
+ */
+async function proxyCryptoPrice(params) {
+  const coin = (params?.coin || params?.crypto || params?.id || 'bitcoin').toLowerCase();
+  const currency = (params?.currency || params?.vs || 'usd').toLowerCase();
+
+  // Map common symbols to CoinGecko IDs
+  const coinMap = {
+    'btc': 'bitcoin', 'eth': 'ethereum', 'bsv': 'bitcoin-sv',
+    'ltc': 'litecoin', 'xrp': 'ripple', 'doge': 'dogecoin',
+    'ada': 'cardano', 'sol': 'solana', 'dot': 'polkadot',
+    'matic': 'matic-network', 'link': 'chainlink', 'avax': 'avalanche-2',
+  };
+  const coinId = coinMap[coin] || coin;
+
+  const url = `https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=${currency}&include_24hr_change=true&include_market_cap=true&include_24hr_vol=true`;
+  const resp = await fetchWithTimeout(url, {}, 10000);
+
+  if (!resp.ok) {
+    return { error: `Crypto price API returned ${resp.status}` };
+  }
+
+  const data = await resp.json();
+  const coinData = data[coinId];
+
+  if (!coinData) {
+    return { error: `Coin not found: ${coin}`, suggestion: 'Use CoinGecko ID (e.g., "bitcoin", "ethereum", "bitcoin-sv")' };
+  }
+
+  return {
+    api: 'crypto-price',
+    coin: coinId,
+    currency: currency.toUpperCase(),
+    price: coinData[currency],
+    change24h: coinData[`${currency}_24h_change`],
+    marketCap: coinData[`${currency}_market_cap`],
+    volume24h: coinData[`${currency}_24h_vol`],
+    provider: 'CoinGecko',
+  };
 }
 
 /** Analyze a GitHub PR diff for common issues. */
