@@ -194,7 +194,7 @@ function stopBackgroundService() {
   stopAutoImport();
 }
 
-export default async function register(api) {
+export default function register(api) {
   // Capture config at registration time (api.getConfig may not be available later)
   const pluginConfig = api.getConfig?.()?.plugins?.entries?.['bsv-overlay']?.config || api.config || {};
 
@@ -472,26 +472,23 @@ export default async function register(api) {
       });
   }, { commands: ["overlay"] });
 
-  // Auto-setup: ensure wallet exists (best-effort, non-fatal)
-  try {
-    const config = pluginConfig;
-    const walletDir = config?.walletDir || path.join(process.env.HOME || '', '.clawdbot', 'bsv-wallet');
-    const identityFile = path.join(walletDir, 'wallet-identity.json');
-    if (!fs.existsSync(identityFile)) {
-      api.log?.info?.('[bsv-overlay] No wallet found — running auto-setup...');
-      try {
+  // Auto-setup: ensure wallet exists (best-effort, non-fatal, fire-and-forget)
+  (async () => {
+    try {
+      const config = pluginConfig;
+      const walletDir = config?.walletDir || path.join(process.env.HOME || '', '.clawdbot', 'bsv-wallet');
+      const identityFile = path.join(walletDir, 'wallet-identity.json');
+      if (!fs.existsSync(identityFile)) {
+        api.log?.info?.('[bsv-overlay] No wallet found — running auto-setup...');
         const env = buildEnvironment(config || {});
         const cliPath = path.join(__dirname, 'scripts', 'overlay-cli.mjs');
         await execFileAsync('node', [cliPath, 'setup'], { env });
         api.log?.info?.('[bsv-overlay] Wallet initialized. Fund it and run: overlay({ action: "register" })');
-      } catch (err: any) {
-        api.log?.warn?.('[bsv-overlay] Auto-setup failed:', err.message);
       }
+    } catch (err: any) {
+      api.log?.debug?.('[bsv-overlay] Auto-setup skipped:', err.message);
     }
-  } catch (err: any) {
-    // Non-fatal — plugin still loads if auto-setup fails
-    api.log?.debug?.('[bsv-overlay] Auto-setup skipped:', err.message);
-  }
+  })();
 }
 
 async function executeOverlayAction(params, config, api) {
