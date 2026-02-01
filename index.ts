@@ -2,6 +2,7 @@ import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import fs from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -10,6 +11,168 @@ const execFileAsync = promisify(execFile);
 
 // Track background process for proper lifecycle management
 let backgroundProcess: any = null;
+let serviceRunning = false;
+
+// Auto-import tracking
+let autoImportInterval: any = null;
+let knownTxids: Set<string> = new Set();
+
+// Budget tracking
+const BUDGET_FILE = 'daily-spending.json';
+
+interface DailySpending {
+  date: string; // YYYY-MM-DD
+  totalSats: number;
+  transactions: Array<{ ts: number; sats: number; service: string; provider: string }>;
+}
+
+function getBudgetPath(walletDir: string): string {
+  return path.join(walletDir, BUDGET_FILE);
+}
+
+function loadDailySpending(walletDir: string): DailySpending {
+  const today = new Date().toISOString().slice(0, 10);
+  const budgetPath = getBudgetPath(walletDir);
+  try {
+    const data = JSON.parse(fs.readFileSync(budgetPath, 'utf-8'));
+    if (data.date === today) return data;
+  } catch {}
+  return { date: today, totalSats: 0, transactions: [] };
+}
+
+function recordSpend(walletDir: string, sats: number, service: string, provider: string) {
+  const spending = loadDailySpending(walletDir);
+  spending.totalSats += sats;
+  spending.transactions.push({ ts: Date.now(), sats, service, provider });
+  fs.writeFileSync(getBudgetPath(walletDir), JSON.stringify(spending, null, 2));
+}
+
+function checkBudget(walletDir: string, requestedSats: number, dailyLimit: number): { allowed: boolean; remaining: number; spent: number } {
+  const spending = loadDailySpending(walletDir);
+  const remaining = dailyLimit - spending.totalSats;
+  return {
+    allowed: remaining >= requestedSats,
+    remaining,
+    spent: spending.totalSats
+  };
+}
+
+async function startAutoImport(env, cliPath, logger) {
+  // Get our address
+  try {
+    const addrResult = await execFileAsync('node', [cliPath, 'address'], { env });
+    const addrOutput = parseCliOutput(addrResult.stdout);
+    if (!addrOutput.success) return;
+    const address = addrOutput.data?.address;
+    if (!address) return;
+    
+    // Load known txids from wallet state
+    const balResult = await execFileAsync('node', [cliPath, 'balance'], { env });
+    const balOutput = parseCliOutput(balResult.stdout);
+    // Track what we already have
+    
+    autoImportInterval = setInterval(async () => {
+      try {
+        const network = env.BSV_NETWORK === 'testnet' ? 'test' : 'main';
+        const resp = await fetch(`https://api.whatsonchain.com/v1/bsv/${network}/address/${address}/unspent`);
+        if (!resp.ok) return;
+        const utxos = await resp.json();
+        
+        for (const utxo of utxos) {
+          const key = `${utxo.tx_hash}:${utxo.tx_pos}`;
+          if (knownTxids.has(key)) continue;
+          if (utxo.value < 200) continue; // skip dust
+          
+          logger?.info?.(`[bsv-overlay] Auto-importing UTXO: ${utxo.tx_hash}:${utxo.tx_pos} (${utxo.value} sats)`);
+          try {
+            const importResult = await execFileAsync('node', [cliPath, 'import', utxo.tx_hash, String(utxo.tx_pos)], { env });
+            const importOutput = parseCliOutput(importResult.stdout);
+            if (importOutput.success) {
+              knownTxids.add(key);
+              logger?.info?.(`[bsv-overlay] Auto-imported ${utxo.value} sats from ${utxo.tx_hash}`);
+            }
+          } catch (err) {
+            // Already imported or error — track it so we don't retry
+            knownTxids.add(key);
+          }
+        }
+      } catch (err) {
+        // WoC API error — just skip this cycle
+      }
+    }, 60000); // Check every 60 seconds
+  } catch (err) {
+    logger?.warn?.('[bsv-overlay] Auto-import setup failed:', err.message);
+  }
+}
+
+function stopAutoImport() {
+  if (autoImportInterval) {
+    clearInterval(autoImportInterval);
+    autoImportInterval = null;
+  }
+}
+
+function startBackgroundService(env, cliPath, logger) {
+  if (backgroundProcess) return;
+  serviceRunning = true;
+  
+  function spawnConnect() {
+    if (!serviceRunning) return;
+    
+    const proc = spawn('node', [cliPath, 'connect'], {
+      env,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    
+    backgroundProcess = proc;
+    
+    proc.stdout?.on('data', (data) => {
+      // Log incoming service fulfillments
+      const lines = data.toString().split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
+          const event = JSON.parse(line);
+          logger?.info?.(`[bsv-overlay] ${event.event || event.type || 'message'}:`, JSON.stringify(event).slice(0, 200));
+        } catch {}
+      }
+    });
+    
+    proc.stderr?.on('data', (data) => {
+      const lines = data.toString().split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
+          const event = JSON.parse(line);
+          if (event.event === 'connected') {
+            logger?.info?.('[bsv-overlay] WebSocket relay connected');
+          } else if (event.event === 'disconnected') {
+            logger?.warn?.('[bsv-overlay] WebSocket disconnected, reconnecting...');
+          }
+        } catch {
+          logger?.debug?.(`[bsv-overlay] ${line}`);
+        }
+      }
+    });
+    
+    proc.on('exit', (code) => {
+      backgroundProcess = null;
+      if (serviceRunning) {
+        logger?.warn?.(`[bsv-overlay] Background service exited (code ${code}), restarting in 5s...`);
+        setTimeout(spawnConnect, 5000);
+      }
+    });
+  }
+  
+  spawnConnect();
+}
+
+function stopBackgroundService() {
+  serviceRunning = false;
+  if (backgroundProcess) {
+    backgroundProcess.kill('SIGTERM');
+    backgroundProcess = null;
+  }
+  stopAutoImport();
+}
 
 export default function register(api) {
   // Register the overlay agent tool
@@ -24,7 +187,8 @@ export default function register(api) {
           enum: [
             "request", "discover", "balance", "status", "pay", 
             "setup", "address", "import", "register", "advertise", 
-            "readvertise", "remove", "send", "inbox", "services", "refund"
+            "readvertise", "remove", "send", "inbox", "services", "refund",
+            "onboard"
           ],
           description: "Action to perform"
         },
@@ -138,56 +302,20 @@ export default function register(api) {
         const env = buildEnvironment(config);
         const cliPath = path.join(__dirname, 'scripts', 'overlay-cli.mjs');
         
-        // Start the WebSocket connection using spawn instead of execFile
-        backgroundProcess = spawn('node', [cliPath, 'connect'], { 
-          env,
-          stdio: 'pipe',
-          detached: false
-        });
-
-        backgroundProcess.stdout?.on('data', (data) => {
-          try {
-            const output = JSON.parse(data.toString().trim());
-            if (output.event) {
-              api.logger.info(`BSV relay event: ${output.event}`, output);
-            }
-          } catch (e) {
-            api.logger.debug(`BSV relay output: ${data.toString().trim()}`);
-          }
-        });
-
-        backgroundProcess.stderr?.on('data', (data) => {
-          api.logger.warn(`BSV relay stderr: ${data.toString().trim()}`);
-        });
-
-        backgroundProcess.on('close', (code) => {
-          api.logger.info(`BSV relay process exited with code ${code}`);
-          backgroundProcess = null;
-        });
-
-        backgroundProcess.on('error', (error) => {
-          api.logger.error(`BSV relay process error: ${error.message}`);
-          backgroundProcess = null;
-        });
+        // Use the improved background service
+        startBackgroundService(env, cliPath, api.logger);
+        
+        // Start auto-import
+        startAutoImport(env, cliPath, api.logger);
 
         api.logger.info("BSV overlay WebSocket relay started");
       } catch (error) {
         api.logger.error(`Failed to start BSV overlay relay: ${error.message}`);
-        backgroundProcess = null;
       }
     },
     stop: async () => {
       api.logger.info("Stopping BSV overlay WebSocket relay...");
-      if (backgroundProcess) {
-        backgroundProcess.kill('SIGTERM');
-        // Give it a moment to close gracefully
-        setTimeout(() => {
-          if (backgroundProcess && !backgroundProcess.killed) {
-            backgroundProcess.kill('SIGKILL');
-          }
-        }, 2000);
-        backgroundProcess = null;
-      }
+      stopBackgroundService();
       api.logger.info("BSV overlay WebSocket relay stopped");
     }
   });
@@ -307,6 +435,22 @@ export default function register(api) {
         }
       });
   }, { commands: ["overlay"] });
+
+  // Auto-setup: ensure wallet exists
+  const config = api.getConfig()?.plugins?.entries?.['bsv-overlay']?.config || {};
+  const walletDir = config?.walletDir || path.join(process.env.HOME || '', '.clawdbot', 'bsv-wallet');
+  const identityFile = path.join(walletDir, 'wallet-identity.json');
+  if (!fs.existsSync(identityFile)) {
+    api.log?.info?.('[bsv-overlay] No wallet found — running auto-setup...');
+    try {
+      const env = buildEnvironment(config || {});
+      const cliPath = path.join(__dirname, 'scripts', 'overlay-cli.mjs');
+      await execFileAsync('node', [cliPath, 'setup'], { env });
+      api.log?.info?.('[bsv-overlay] Wallet initialized. Fund it and run: overlay({ action: "register" })');
+    } catch (err) {
+      api.log?.warn?.('[bsv-overlay] Auto-setup failed:', err.message);
+    }
+  }
 }
 
 async function executeOverlayAction(params, config, api) {
@@ -328,7 +472,7 @@ async function executeOverlayAction(params, config, api) {
       return await handleStatus(env, cliPath);
     
     case "pay":
-      return await handleDirectPay(params, env, cliPath);
+      return await handleDirectPay(params, env, cliPath, config);
 
     case "setup":
       return await handleSetup(env, cliPath);
@@ -362,6 +506,9 @@ async function executeOverlayAction(params, config, api) {
 
     case "refund":
       return await handleRefund(params, env, cliPath);
+
+    case "onboard":
+      return await handleOnboard(env, cliPath);
     
     default:
       throw new Error(`Unknown action: ${action}`);
@@ -370,6 +517,7 @@ async function executeOverlayAction(params, config, api) {
 
 async function handleServiceRequest(params, env, cliPath, config, api) {
   const { service, input, maxPrice } = params;
+  const walletDir = config?.walletDir || path.join(process.env.HOME || '', '.clawdbot', 'bsv-wallet');
   
   if (!service) {
     throw new Error("Service is required for request action");
@@ -413,9 +561,16 @@ async function handleServiceRequest(params, env, cliPath, config, api) {
     throw new Error(`Service price (${price} sats) exceeds limit (${userMaxPrice} sats)`);
   }
 
+  // 5. Check daily budget
+  const dailyLimit = config.dailyBudgetSats || 1000;
+  const budgetCheck = checkBudget(walletDir, price, dailyLimit);
+  if (!budgetCheck.allowed) {
+    throw new Error(`Service request would exceed daily budget. Spent: ${budgetCheck.spent} sats, Remaining: ${budgetCheck.remaining} sats, Requested: ${price} sats. Please confirm with user.`);
+  }
+
   api.logger.info(`Requesting service ${service} from ${bestProvider.agentName} for ${price} sats`);
 
-  // 5. Request the service
+  // 6. Request the service
   const requestArgs = [cliPath, 'request-service', bestProvider.identityKey, service, price.toString()];
   if (input) {
     requestArgs.push(JSON.stringify(input));
@@ -428,7 +583,7 @@ async function handleServiceRequest(params, env, cliPath, config, api) {
     throw new Error(`Service request failed: ${requestOutput.error}`);
   }
 
-  // 6. Poll for response
+  // 7. Poll for response
   const maxPollAttempts = 12; // ~60 seconds with 5 second intervals
   let attempts = 0;
   
@@ -446,6 +601,8 @@ async function handleServiceRequest(params, env, cliPath, config, api) {
         for (const msg of messages) {
           if (msg.type === 'service-response' && msg.from === bestProvider.identityKey) {
             api.logger.info(`Received response from ${bestProvider.agentName}`);
+            // Record the spending
+            recordSpend(walletDir, price, service, bestProvider.agentName);
             return {
               provider: bestProvider.agentName,
               cost: price,
@@ -519,11 +676,19 @@ async function handleStatus(env, cliPath) {
   }
 }
 
-async function handleDirectPay(params, env, cliPath) {
+async function handleDirectPay(params, env, cliPath, config) {
   const { identityKey, sats, description } = params;
+  const walletDir = config?.walletDir || path.join(process.env.HOME || '', '.clawdbot', 'bsv-wallet');
   
   if (!identityKey || !sats) {
     throw new Error("identityKey and sats are required for pay action");
+  }
+
+  // Check daily budget
+  const dailyLimit = config?.dailyBudgetSats || 1000;
+  const budgetCheck = checkBudget(walletDir, sats, dailyLimit);
+  if (!budgetCheck.allowed) {
+    throw new Error(`Payment would exceed daily budget. Spent: ${budgetCheck.spent} sats, Remaining: ${budgetCheck.remaining} sats, Requested: ${sats} sats. Please confirm with user.`);
   }
   
   const args = [cliPath, 'pay', identityKey, sats.toString()];
@@ -537,6 +702,9 @@ async function handleDirectPay(params, env, cliPath) {
   if (!output.success) {
     throw new Error(`Payment failed: ${output.error}`);
   }
+
+  // Record the spending
+  recordSpend(walletDir, sats, 'direct-payment', identityKey);
   
   return output.data;
 }
@@ -709,6 +877,63 @@ async function handleRefund(params, env, cliPath) {
   }
   
   return output.data;
+}
+
+async function handleOnboard(env, cliPath) {
+  const steps = [];
+  
+  // Step 1: Setup wallet
+  try {
+    const setup = await execFileAsync('node', [cliPath, 'setup'], { env });
+    const setupOutput = parseCliOutput(setup.stdout);
+    steps.push({ step: 'setup', success: true, identityKey: setupOutput.data?.identityKey });
+  } catch (err) {
+    steps.push({ step: 'setup', success: false, error: err.message });
+    return { steps, nextStep: 'Fix wallet setup error and try again' };
+  }
+  
+  // Step 2: Get address
+  try {
+    const addr = await execFileAsync('node', [cliPath, 'address'], { env });
+    const addrOutput = parseCliOutput(addr.stdout);
+    steps.push({ step: 'address', success: true, address: addrOutput.data?.address });
+  } catch (err) {
+    steps.push({ step: 'address', success: false, error: err.message });
+  }
+  
+  // Step 3: Check balance
+  try {
+    const bal = await execFileAsync('node', [cliPath, 'balance'], { env });
+    const balOutput = parseCliOutput(bal.stdout);
+    const balance = balOutput.data?.walletBalance || balOutput.data?.onChain?.confirmed || 0;
+    steps.push({ step: 'balance', success: true, balance });
+    
+    if (balance < 1000) {
+      return {
+        steps,
+        funded: false,
+        nextStep: `Fund your wallet with at least 1,000 sats. Send BSV to: ${steps[1]?.address}. Auto-import is running — once funded, run overlay({ action: "onboard" }) again.`
+      };
+    }
+  } catch (err) {
+    steps.push({ step: 'balance', success: false, error: err.message });
+  }
+  
+  // Step 4: Register
+  try {
+    const reg = await execFileAsync('node', [cliPath, 'register'], { env, timeout: 60000 });
+    const regOutput = parseCliOutput(reg.stdout);
+    steps.push({ step: 'register', success: regOutput.success, data: regOutput.data });
+  } catch (err) {
+    steps.push({ step: 'register', success: false, error: err.message });
+  }
+  
+  return {
+    steps,
+    funded: true,
+    registered: true,
+    message: 'Onboarding complete! Your agent is registered on the BSV overlay network. The background service will handle incoming requests.'
+  };
 }
 
 function buildEnvironment(config) {
