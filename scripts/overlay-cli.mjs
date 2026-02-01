@@ -3751,6 +3751,7 @@ async function cmdResearchRespond(resultJsonPath) {
   const privKey = PrivateKey.fromHex(identity.rootKeyHex);
   const identityKey = privKey.toPublicKey().toString();
   const relayPrivHex = identity.relayKeyHex || identity.rootKeyHex;
+  const relayPrivKey = PrivateKey.fromHex(relayPrivHex);
 
   const responsePayload = {
     requestId,
@@ -3763,7 +3764,7 @@ async function cmdResearchRespond(resultJsonPath) {
     walletAccepted: result.walletAccepted ?? true,
   };
 
-  const sig = signRelayMessage(relayPrivHex, recipientKey, 'service-response', responsePayload);
+  const sig = signRelayMessage(relayPrivKey, recipientKey, 'service-response', responsePayload);
   const sendResp = await fetch(`${OVERLAY_URL}/relay/send`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
