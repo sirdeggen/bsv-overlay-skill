@@ -1857,6 +1857,27 @@ function formatServiceResponse(serviceId, status, result) {
         },
       };
     
+    case 'memory-store':
+      const op = result?.operation || 'unknown';
+      let memorySummary = result?.error ? `Memory store (${op}) failed: ${result.error}` : `Memory store ${op} completed`;
+      if (!result?.error) {
+        if (op === 'set') {
+          memorySummary = `Stored: ${result?.namespace}/${result?.key}`;
+        } else if (op === 'get') {
+          memorySummary = result?.found ? `Retrieved: ${result?.namespace}/${result?.key}` : `Not found: ${result?.namespace}/${result?.key}`;
+        } else if (op === 'delete') {
+          memorySummary = result?.deleted ? `Deleted: ${result?.namespace}/${result?.key}` : `Not found: ${result?.namespace}/${result?.key}`;
+        } else if (op === 'list') {
+          memorySummary = `Listed ${result?.keys?.length || 0} keys in ${result?.namespace}`;
+        }
+      }
+      return {
+        ...base,
+        type: 'memory-store',
+        summary: memorySummary,
+        details: result,
+      };
+    
     default:
       // Generic service response — show preview of result
       const resultPreview = result
@@ -2039,6 +2060,8 @@ async function processMessage(msg, identityKey, privKey) {
       return await processApiProxy(msg, identityKey, privKey);
     } else if (serviceId === 'roulette') {
       return await processRoulette(msg, identityKey, privKey);
+    } else if (serviceId === 'memory-store') {
+      return await processMemoryStore(msg, identityKey, privKey);
     } else {
       // Unknown service — don't auto-process
       return {
@@ -3166,6 +3189,182 @@ function evaluateRouletteBet(bet, spinResult, betAmount) {
     default:
       return { won: false, payout: 0, multiplier: 0 };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Service: memory-store (10 sats per operation)
+// ---------------------------------------------------------------------------
+
+const MEMORY_STORE_PATH = path.join(WALLET_DIR, 'memory-store.json');
+const MEMORY_STORE_PRICE = 10;
+const MEMORY_STORE_MAX_VALUE_SIZE = 1024; // 1KB
+const MEMORY_STORE_MAX_KEYS_PER_NS = 100;
+
+function loadMemoryStore() {
+  try {
+    if (fs.existsSync(MEMORY_STORE_PATH)) {
+      return JSON.parse(fs.readFileSync(MEMORY_STORE_PATH, 'utf-8'));
+    }
+  } catch { /* corrupted file, start fresh */ }
+  return {};
+}
+
+function saveMemoryStore(store) {
+  try {
+    fs.writeFileSync(MEMORY_STORE_PATH, JSON.stringify(store, null, 2));
+  } catch (err) {
+    throw new Error(`Failed to save memory store: ${err.message}`);
+  }
+}
+
+async function processMemoryStore(msg, identityKey, privKey) {
+  const payment = msg.payload?.payment;
+  const input = msg.payload?.input || msg.payload;
+  const operation = (input?.operation || input?.op || 'get').toLowerCase();
+  const key = input?.key;
+  const value = input?.value;
+  // Default namespace is sender's pubkey (first 16 chars for readability)
+  const namespace = input?.namespace || msg.from.slice(0, 16);
+
+  // Helper to send rejection
+  async function reject(reason, shortReason) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'memory-store',
+      status: 'rejected',
+      reason,
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    }, 15000);
+    return { id: msg.id, type: 'service-request', serviceId: 'memory-store', action: 'rejected', reason: shortReason, from: msg.from, ack: true };
+  }
+
+  // Validate operation
+  const validOps = ['set', 'get', 'delete', 'list'];
+  if (!validOps.includes(operation)) {
+    return reject(`Invalid operation. Supported: ${validOps.join(', ')}. Example: {operation: "set", key: "foo", value: "bar"}`, 'invalid operation');
+  }
+
+  // Validate key for operations that need it
+  if (['set', 'get', 'delete'].includes(operation) && (!key || typeof key !== 'string' || key.length < 1 || key.length > 64)) {
+    return reject('Invalid key. Must be a string 1-64 characters.', 'invalid key');
+  }
+
+  // Validate value for set operation
+  if (operation === 'set') {
+    const valueStr = typeof value === 'string' ? value : JSON.stringify(value);
+    if (!value || valueStr.length > MEMORY_STORE_MAX_VALUE_SIZE) {
+      return reject(`Value too large or missing. Maximum ${MEMORY_STORE_MAX_VALUE_SIZE} bytes.`, 'value too large');
+    }
+  }
+
+  // ── Payment verification ──
+  let walletIdentity;
+  try {
+    walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  } catch (err) {
+    return reject(`Wallet identity not found or corrupted: ${err.message}`, 'wallet error');
+  }
+  const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
+  const payResult = await verifyAndAcceptPayment(payment, MEMORY_STORE_PRICE, msg.from, 'memory-store', ourHash160);
+  if (!payResult.accepted) {
+    return reject(`Payment rejected: ${payResult.error}. Memory store costs ${MEMORY_STORE_PRICE} sats per operation.`, payResult.error);
+  }
+
+  const paymentTxid = payResult.txid;
+  const paymentSats = payResult.satoshis;
+  const walletAccepted = payResult.walletAccepted;
+  const acceptError = payResult.error;
+
+  // ── Execute the operation ──
+  const store = loadMemoryStore();
+  if (!store[namespace]) store[namespace] = {};
+  const ns = store[namespace];
+
+  let opResult;
+
+  switch (operation) {
+    case 'set':
+      // Check key limit
+      if (Object.keys(ns).length >= MEMORY_STORE_MAX_KEYS_PER_NS && !(key in ns)) {
+        opResult = { operation: 'set', error: `Namespace has reached the maximum of ${MEMORY_STORE_MAX_KEYS_PER_NS} keys.` };
+        break;
+      }
+      ns[key] = { value, updatedAt: Date.now(), updatedBy: msg.from };
+      saveMemoryStore(store);
+      opResult = { operation: 'set', namespace, key, success: true, message: `Stored value for key "${key}"` };
+      break;
+
+    case 'get':
+      if (key in ns) {
+        opResult = { operation: 'get', namespace, key, found: true, value: ns[key].value, updatedAt: ns[key].updatedAt };
+      } else {
+        opResult = { operation: 'get', namespace, key, found: false, message: `Key "${key}" not found` };
+      }
+      break;
+
+    case 'delete':
+      if (key in ns) {
+        delete ns[key];
+        saveMemoryStore(store);
+        opResult = { operation: 'delete', namespace, key, deleted: true, message: `Deleted key "${key}"` };
+      } else {
+        opResult = { operation: 'delete', namespace, key, deleted: false, message: `Key "${key}" not found` };
+      }
+      break;
+
+    case 'list':
+      const keys = Object.keys(ns);
+      opResult = { operation: 'list', namespace, keys, count: keys.length };
+      break;
+  }
+
+  // Send response
+  const responsePayload = {
+    requestId: msg.id,
+    serviceId: 'memory-store',
+    status: opResult.error ? 'partial' : 'fulfilled',
+    result: opResult,
+    paymentAccepted: true,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    ...(acceptError ? { walletError: acceptError } : {}),
+  };
+  const respSig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
+  await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: identityKey, to: msg.from, type: 'service-response',
+      payload: responsePayload, signature: respSig,
+    }),
+  }, 15000);
+
+  return {
+    id: msg.id,
+    type: 'service-request',
+    serviceId: 'memory-store',
+    action: opResult.error ? 'partial' : 'fulfilled',
+    result: opResult,
+    paymentAccepted: true,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    direction: 'incoming-request',
+    formatted: {
+      type: 'memory-store',
+      summary: opResult.error || opResult.message || `${operation} completed`,
+      earnings: paymentSats,
+    },
+    ...(acceptError ? { walletError: acceptError } : {}),
+    from: msg.from,
+    ack: true,
+  };
 }
 
 /** Analyze a GitHub PR diff for common issues. */

@@ -183,6 +183,9 @@ node scripts/overlay-cli.mjs advertise api-proxy "API Proxy" "Access free APIs: 
 # Advertise a roulette gambling service (bet amount = payment)
 node scripts/overlay-cli.mjs advertise roulette "Roulette" "European roulette (single zero). Bet 10-1000 sats. Options: number (0-36), red, black, odd, even, low, high, 1st12, 2nd12, 3rd12. Input: {bet: 'red'}" 0
 
+# Advertise a persistent memory store service at 10 sats
+node scripts/overlay-cli.mjs advertise memory-store "Memory Store" "Persistent key-value store. Operations: set, get, delete, list. Input: {operation, key, value?, namespace?}" 10
+
 # View all your advertised services
 node scripts/overlay-cli.mjs services
 
@@ -382,7 +385,7 @@ When your agent receives a `service-request` via `poll`:
 3. Your handler generates a result and sends a `service-response` back
 4. The requesting agent picks up the response on their next `poll`
 
-Currently supported: `tell-joke`, `code-review`, `web-research`, `translate`, `api-proxy`, `roulette`. Add more handlers in the `cmdPoll` function.
+Currently supported: `tell-joke`, `code-review`, `web-research`, `translate`, `api-proxy`, `roulette`, `memory-store`. Add more handlers in the `cmdPoll` function.
 
 ## Configuration
 
