@@ -677,8 +677,11 @@ async function handleServiceRequest(params, env, cliPath, config, api) {
     throw new Error(`Service request failed: ${requestOutput.error}`);
   }
 
-  // 7. Poll for response
-  const maxPollAttempts = 12; // ~60 seconds with 5 second intervals
+  // 7. Poll for response (up to 120s, with early return)
+  // The WebSocket background service will also receive the response
+  // asynchronously, so we return a "pending" status if we time out
+  // rather than throwing an error.
+  const maxPollAttempts = 24; // ~120 seconds with 5 second intervals
   let attempts = 0;
   
   while (attempts < maxPollAttempts) {
@@ -690,7 +693,7 @@ async function handleServiceRequest(params, env, cliPath, config, api) {
       const pollOutput = parseCliOutput(pollResult.stdout);
       
       if (pollOutput.success && pollOutput.data) {
-        // FIX: Check pollOutput.data.messages array for service-response
+        // Check pollOutput.data.messages array for service-response
         const messages = pollOutput.data.messages || [];
         for (const msg of messages) {
           if (msg.type === 'service-response' && msg.from === bestProvider.identityKey) {
@@ -711,7 +714,17 @@ async function handleServiceRequest(params, env, cliPath, config, api) {
     }
   }
   
-  throw new Error(`Service request timed out after ${maxPollAttempts * 5} seconds`);
+  // Don't throw — the response may still arrive via WebSocket
+  // Record the spend since payment was already sent
+  recordSpend(walletDir, price, service, bestProvider.agentName);
+  return {
+    provider: bestProvider.agentName,
+    cost: price,
+    status: "pending",
+    message: `Request sent and paid (${price} sats). The provider hasn't responded within 120s, but the response may still arrive via the background WebSocket service. Check notifications later.`,
+    requestId: requestOutput.data?.messageId,
+    providerKey: bestProvider.identityKey,
+  };
 }
 
 async function handleDiscover(params, env, cliPath) {
