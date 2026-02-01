@@ -3,6 +3,7 @@ import { promisify } from 'util';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import WebSocket from 'ws';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -140,6 +141,31 @@ function stopAutoImport() {
   }
 }
 
+// Wake the agent via gateway WebSocket JSON-RPC (event-driven, zero polling)
+function wakeAgent(text: string, logger?: any) {
+  try {
+    const ws = new WebSocket('ws://127.0.0.1:18789');
+    const timeout = setTimeout(() => { try { ws.close(); } catch {} }, 5000);
+    ws.on('open', () => {
+      ws.send(JSON.stringify({
+        jsonrpc: '2.0',
+        id: `overlay-wake-${Date.now()}`,
+        method: 'cron.wake',
+        params: { mode: 'now', text },
+      }));
+      clearTimeout(timeout);
+      setTimeout(() => { try { ws.close(); } catch {} }, 500);
+      logger?.info?.('[bsv-overlay] Agent woken via WebSocket');
+    });
+    ws.on('error', (err) => {
+      clearTimeout(timeout);
+      logger?.warn?.('[bsv-overlay] WebSocket wake failed:', err.message);
+    });
+  } catch (err: any) {
+    logger?.warn?.('[bsv-overlay] Wake failed:', err.message);
+  }
+}
+
 // Categorize WebSocket events into notification types
 function categorizeEvent(event) {
   const base = { ts: Date.now(), from: event.from?.slice(0, 16), fullFrom: event.from };
@@ -191,18 +217,11 @@ function startBackgroundService(env, cliPath, logger) {
           const alertDir = path.join(process.env.HOME || '', '.clawdbot', 'bsv-overlay');
           fs.mkdirSync(alertDir, { recursive: true });
           
-          // Detect queued-for-agent events — write fulfillment alert
+          // Detect queued-for-agent events — wake agent via WebSocket
           if (event.action === 'queued-for-agent' && event.serviceId) {
             logger?.info?.(`[bsv-overlay] ⚡ Incoming ${event.serviceId} request from ${event.from?.slice(0, 12)}...`);
-            try {
-              fs.appendFileSync(path.join(alertDir, 'pending-alert.jsonl'), JSON.stringify({
-                requestId: event.id,
-                serviceId: event.serviceId,
-                from: event.from,
-                satoshis: event.satoshisReceived,
-                ts: Date.now(),
-              }) + '\n');
-            } catch {}
+            const wakeText = `⚡ Incoming overlay service request!\n\nService: ${event.serviceId}\nFrom: ${event.from}\nPaid: ${event.satoshisReceived || '?'} sats\n\nFulfill it now:\n1. overlay({ action: "pending-requests" })\n2. Process the ${event.serviceId} request using your capabilities\n3. overlay({ action: "fulfill", requestId: "${event.id}", recipientKey: "${event.from}", serviceId: "${event.serviceId}", result: { ... } })`;
+            wakeAgent(wakeText, logger);
           }
           
           // Write payment/activity notifications for ALL significant events
