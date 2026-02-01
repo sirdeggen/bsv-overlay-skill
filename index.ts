@@ -90,6 +90,21 @@ async function startAutoImport(env, cliPath, logger) {
             if (importOutput.success) {
               knownTxids.add(key);
               logger?.info?.(`[bsv-overlay] Auto-imported ${utxo.value} sats from ${utxo.tx_hash}`);
+              
+              // Check if registered, auto-register if not
+              try {
+                const regPath = path.join(process.env.HOME || '', '.clawdbot', 'bsv-overlay', 'registration.json');
+                if (!fs.existsSync(regPath)) {
+                  logger?.info?.('[bsv-overlay] Not yet registered — auto-registering...');
+                  const regResult = await execFileAsync('node', [cliPath, 'register'], { env, timeout: 60000 });
+                  const regOutput = parseCliOutput(regResult.stdout);
+                  if (regOutput.success) {
+                    logger?.info?.('[bsv-overlay] Auto-registered on overlay network!');
+                  }
+                }
+              } catch (err) {
+                logger?.warn?.('[bsv-overlay] Auto-registration failed:', err.message);
+              }
             }
           } catch (err) {
             // Already imported or error — track it so we don't retry
@@ -188,7 +203,7 @@ export default function register(api) {
             "request", "discover", "balance", "status", "pay", 
             "setup", "address", "import", "register", "advertise", 
             "readvertise", "remove", "send", "inbox", "services", "refund",
-            "onboard"
+            "onboard", "pending-requests", "fulfill"
           ],
           description: "Action to perform"
         },
@@ -266,6 +281,19 @@ export default function register(api) {
         address: {
           type: "string",
           description: "Destination address for refund"
+        },
+        // Fulfill parameters
+        requestId: {
+          type: "string",
+          description: "Request ID for fulfill"
+        },
+        recipientKey: {
+          type: "string",
+          description: "Recipient identity key for fulfill"
+        },
+        result: {
+          type: "object",
+          description: "Service result for fulfill"
         }
       },
       required: ["action"]
@@ -509,6 +537,12 @@ async function executeOverlayAction(params, config, api) {
 
     case "onboard":
       return await handleOnboard(env, cliPath);
+    
+    case "pending-requests":
+      return await handlePendingRequests(env, cliPath);
+    
+    case "fulfill":
+      return await handleFulfill(params, env, cliPath);
     
     default:
       throw new Error(`Unknown action: ${action}`);
@@ -761,7 +795,21 @@ async function handleRegister(env, cliPath) {
     throw new Error(`Registration failed: ${output.error}`);
   }
   
-  return output.data;
+  return {
+    ...output.data,
+    registered: true,
+    availableServices: [
+      { serviceId: "tell-joke", name: "Random Joke", description: "Get a random joke", suggestedPrice: 5 },
+      { serviceId: "code-review", name: "Code Review", description: "Review code for bugs, security, and style", suggestedPrice: 50 },
+      { serviceId: "web-research", name: "Web Research", description: "Research a topic using web sources", suggestedPrice: 50 },
+      { serviceId: "translate", name: "Translation", description: "Translate text between languages", suggestedPrice: 20 },
+      { serviceId: "api-proxy", name: "API Proxy", description: "Proxy requests to public APIs", suggestedPrice: 15 },
+      { serviceId: "roulette", name: "Roulette", description: "Casino-style roulette game", suggestedPrice: 10 },
+      { serviceId: "memory-store", name: "Memory Store", description: "Key-value storage for agents", suggestedPrice: 10 },
+      { serviceId: "code-develop", name: "Code Development", description: "Generate code from requirements", suggestedPrice: 100 }
+    ],
+    nextStep: "Choose which services to advertise. Call overlay({ action: 'advertise', ... }) for each."
+  };
 }
 
 async function handleAdvertise(params, env, cliPath) {
@@ -932,8 +980,40 @@ async function handleOnboard(env, cliPath) {
     steps,
     funded: true,
     registered: true,
+    availableServices: [
+      { serviceId: "tell-joke", name: "Random Joke", description: "Get a random joke", suggestedPrice: 5 },
+      { serviceId: "code-review", name: "Code Review", description: "Review code for bugs, security, and style", suggestedPrice: 50 },
+      { serviceId: "web-research", name: "Web Research", description: "Research a topic using web sources", suggestedPrice: 50 },
+      { serviceId: "translate", name: "Translation", description: "Translate text between languages", suggestedPrice: 20 },
+      { serviceId: "api-proxy", name: "API Proxy", description: "Proxy requests to public APIs", suggestedPrice: 15 },
+      { serviceId: "roulette", name: "Roulette", description: "Casino-style roulette game", suggestedPrice: 10 },
+      { serviceId: "memory-store", name: "Memory Store", description: "Key-value storage for agents", suggestedPrice: 10 },
+      { serviceId: "code-develop", name: "Code Development", description: "Generate code from requirements", suggestedPrice: 100 }
+    ],
+    nextStep: "Choose which services to advertise. Call overlay({ action: 'advertise', ... }) for each.",
     message: 'Onboarding complete! Your agent is registered on the BSV overlay network. The background service will handle incoming requests.'
   };
+}
+
+async function handlePendingRequests(env, cliPath) {
+  const result = await execFileAsync('node', [cliPath, 'service-queue'], { env });
+  const output = parseCliOutput(result.stdout);
+  if (!output.success) throw new Error(`Queue check failed: ${output.error}`);
+  return output.data;
+}
+
+async function handleFulfill(params, env, cliPath) {
+  const { requestId, recipientKey, serviceId, result } = params;
+  if (!requestId || !recipientKey || !serviceId || !result) {
+    throw new Error("requestId, recipientKey, serviceId, and result are required");
+  }
+  
+  const cliResult = await execFileAsync('node', [
+    cliPath, 'respond-service', requestId, recipientKey, serviceId, JSON.stringify(result)
+  ], { env });
+  const output = parseCliOutput(cliResult.stdout);
+  if (!output.success) throw new Error(`Fulfill failed: ${output.error}`);
+  return output.data;
 }
 
 function buildEnvironment(config) {
@@ -949,6 +1029,7 @@ function buildEnvironment(config) {
   // Set defaults
   env.BSV_NETWORK = env.BSV_NETWORK || 'mainnet';
   env.AGENT_NAME = env.AGENT_NAME || 'clawdbot-agent';
+  env.AGENT_ROUTED = 'true'; // Route service requests through the agent
   
   return env;
 }

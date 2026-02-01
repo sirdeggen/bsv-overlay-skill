@@ -2123,6 +2123,13 @@ async function processMessage(msg, identityKey, privKey) {
 
   } else if (msg.type === 'service-request') {
     const serviceId = msg.payload?.serviceId;
+    
+    // Agent-routed mode: queue for the agent instead of hardcoded handlers
+    if (process.env.AGENT_ROUTED === 'true') {
+      return await queueForAgent(msg, identityKey, privKey, serviceId);
+    }
+    
+    // Legacy hardcoded handlers (when not in agent-routed mode)
     if (serviceId === 'tell-joke') {
       return await processJokeRequest(msg, identityKey, privKey);
     } else if (serviceId === 'code-review') {
@@ -2178,6 +2185,63 @@ async function processMessage(msg, identityKey, privKey) {
       action: 'unhandled', ack: false,
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Agent-routed service queue function
+// ---------------------------------------------------------------------------
+
+async function queueForAgent(msg, identityKey, privKey, serviceId) {
+  const payment = msg.payload?.payment;
+  const input = msg.payload?.input || msg.payload;
+  
+  // Verify and accept payment
+  const walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
+  
+  // Find the service price (from local services registry)
+  const services = loadServices();
+  const svc = services.find(s => s.serviceId === serviceId);
+  const minPrice = svc?.priceSats || 5; // default to 5 sats minimum
+  
+  const payResult = await verifyAndAcceptPayment(payment, minPrice, msg.from, serviceId, ourHash160);
+  if (!payResult.accepted) {
+    // Send rejection
+    const rejectPayload = { requestId: msg.id, serviceId, status: 'rejected', reason: `Payment rejected: ${payResult.error}` };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetch(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId, action: 'rejected', reason: payResult.error, from: msg.from, ack: true };
+  }
+  
+  // Queue for agent processing
+  const queueEntry = {
+    status: 'pending',
+    requestId: msg.id,
+    serviceId,
+    from: msg.from,
+    identityKey,
+    input: input,
+    paymentTxid: payResult.txid,
+    satoshisReceived: payResult.satoshis,
+    walletAccepted: payResult.walletAccepted,
+    _ts: Date.now(),
+  };
+  
+  const queuePath = path.join(OVERLAY_STATE_DIR, 'service-queue.jsonl');
+  fs.mkdirSync(OVERLAY_STATE_DIR, { recursive: true });
+  fs.appendFileSync(queuePath, JSON.stringify(queueEntry) + '\n');
+  
+  return {
+    id: msg.id, type: 'service-request', serviceId,
+    action: 'queued-for-agent',
+    paymentAccepted: true, paymentTxid: payResult.txid,
+    satoshisReceived: payResult.satoshis,
+    from: msg.from, ack: true,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -4265,6 +4329,74 @@ async function cmdResearchRespond(resultJsonPath) {
   ok({ responded: true, requestId, to: recipientKey, query, pushed: sendResult.pushed });
 }
 
+// ---------------------------------------------------------------------------
+// service-queue / respond-service — Agent-routed service fulfillment
+// ---------------------------------------------------------------------------
+
+async function cmdServiceQueue() {
+  const queuePath = path.join(OVERLAY_STATE_DIR, 'service-queue.jsonl');
+  if (!fs.existsSync(queuePath)) return ok({ pending: [], count: 0 });
+  const lines = fs.readFileSync(queuePath, 'utf-8').trim().split('\n').filter(Boolean);
+  const entries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  const pending = entries.filter(e => e.status === 'pending');
+  ok({ pending, count: pending.length, total: entries.length });
+}
+
+async function cmdRespondService(requestId, recipientKey, serviceId, resultJson) {
+  if (!requestId || !recipientKey || !serviceId || !resultJson) {
+    return fail('Usage: respond-service <requestId> <recipientKey> <serviceId> <resultJson>');
+  }
+  
+  let result;
+  try {
+    result = JSON.parse(resultJson);
+  } catch {
+    return fail('resultJson must be valid JSON');
+  }
+  
+  const { identityKey, privKey } = loadIdentity();
+  
+  const responsePayload = {
+    requestId,
+    serviceId,
+    status: 'fulfilled',
+    result,
+  };
+  
+  const sig = signRelayMessage(privKey, recipientKey, 'service-response', responsePayload);
+  const resp = await fetch(`${OVERLAY_URL}/relay/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: identityKey,
+      to: recipientKey,
+      type: 'service-response',
+      payload: responsePayload,
+      signature: sig,
+    }),
+  });
+  
+  if (!resp.ok) return fail(`Relay send failed: ${resp.status}`);
+  
+  // Mark as fulfilled in queue
+  const queuePath = path.join(OVERLAY_STATE_DIR, 'service-queue.jsonl');
+  if (fs.existsSync(queuePath)) {
+    const lines = fs.readFileSync(queuePath, 'utf-8').trim().split('\n').filter(Boolean);
+    const updated = lines.map(line => {
+      try {
+        const entry = JSON.parse(line);
+        if (entry.requestId === requestId) {
+          return JSON.stringify({ ...entry, status: 'fulfilled', fulfilledAt: Date.now() });
+        }
+        return line;
+      } catch { return line; }
+    });
+    fs.writeFileSync(queuePath, updated.join('\n') + '\n');
+  }
+  
+  ok({ sent: true, requestId, serviceId, to: recipientKey });
+}
+
 async function cmdRequestService(targetKey, serviceId, satsStr, inputJsonStr) {
   if (!targetKey || !serviceId) {
     return fail('Usage: request-service <identityKey> <serviceId> [sats] [inputJson]');
@@ -4386,9 +4518,11 @@ try {
     case 'request-service':   await cmdRequestService(args[0], args[1], args[2], args[3]); break;
     case 'research-respond':  await cmdResearchRespond(args[0]); break;
     case 'research-queue':    await cmdResearchQueue(); break;
+    case 'service-queue':     await cmdServiceQueue(); break;
+    case 'respond-service':   await cmdRespondService(args[0], args[1], args[2], args.slice(3).join(' ')); break;
 
     default:
-      fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, services, advertise, readvertise, remove, discover, pay, verify, accept, send, inbox, ack, poll, connect, request-service, research-queue, research-respond`);
+      fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, services, advertise, readvertise, remove, discover, pay, verify, accept, send, inbox, ack, poll, connect, request-service, research-queue, research-respond, service-queue, respond-service`);
   }
 } catch (err) {
   fail(err instanceof Error ? err.message : String(err));
