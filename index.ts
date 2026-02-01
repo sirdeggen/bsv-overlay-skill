@@ -189,7 +189,10 @@ function stopBackgroundService() {
   stopAutoImport();
 }
 
-export default function register(api) {
+export default async function register(api) {
+  // Capture config at registration time (api.getConfig may not be available later)
+  const pluginConfig = api.getConfig?.()?.plugins?.entries?.['bsv-overlay']?.config || api.config || {};
+
   // Register the overlay agent tool
   api.registerTool({
     name: "overlay",
@@ -299,7 +302,7 @@ export default function register(api) {
       required: ["action"]
     },
     async execute(id, params) {
-      const config = api.getConfig()?.plugins?.entries?.['bsv-overlay']?.config || {};
+      const config = pluginConfig;
       
       try {
         const result = await executeOverlayAction(params, config, api);
@@ -326,7 +329,7 @@ export default function register(api) {
     start: async () => {
       api.logger.info("Starting BSV overlay WebSocket relay...");
       try {
-        const config = api.getConfig()?.plugins?.entries?.['bsv-overlay']?.config || {};
+        const config = pluginConfig;
         const env = buildEnvironment(config);
         const cliPath = path.join(__dirname, 'scripts', 'overlay-cli.mjs');
         
@@ -356,7 +359,7 @@ export default function register(api) {
       .description("Show identity, balance, registration, and services")
       .action(async () => {
         try {
-          const config = api.getConfig()?.plugins?.entries?.['bsv-overlay']?.config || {};
+          const config = pluginConfig;
           const result = await handleStatus(buildEnvironment(config), path.join(__dirname, 'scripts', 'overlay-cli.mjs'));
           console.log("BSV Overlay Status:");
           console.log("Identity:", result.identity);
@@ -371,7 +374,7 @@ export default function register(api) {
       .description("Show wallet balance")
       .action(async () => {
         try {
-          const config = api.getConfig()?.plugins?.entries?.['bsv-overlay']?.config || {};
+          const config = pluginConfig;
           const result = await handleBalance(buildEnvironment(config), path.join(__dirname, 'scripts', 'overlay-cli.mjs'));
           console.log("Balance:", result);
         } catch (error) {
@@ -383,7 +386,7 @@ export default function register(api) {
       .description("Show receive address")
       .action(async () => {
         try {
-          const config = api.getConfig()?.plugins?.entries?.['bsv-overlay']?.config || {};
+          const config = pluginConfig;
           const result = await handleAddress(buildEnvironment(config), path.join(__dirname, 'scripts', 'overlay-cli.mjs'));
           console.log("Address:", result);
         } catch (error) {
@@ -397,7 +400,7 @@ export default function register(api) {
       .option("--agent <name>", "Filter by agent name")
       .action(async (options) => {
         try {
-          const config = api.getConfig()?.plugins?.entries?.['bsv-overlay']?.config || {};
+          const config = pluginConfig;
           const result = await handleDiscover(options, buildEnvironment(config), path.join(__dirname, 'scripts', 'overlay-cli.mjs'));
           console.log("Discovery results:");
           console.log(`Overlay URL: ${result.overlayUrl}`);
@@ -423,7 +426,7 @@ export default function register(api) {
       .description("List our advertised services")
       .action(async () => {
         try {
-          const config = api.getConfig()?.plugins?.entries?.['bsv-overlay']?.config || {};
+          const config = pluginConfig;
           const result = await handleServices(buildEnvironment(config), path.join(__dirname, 'scripts', 'overlay-cli.mjs'));
           console.log("Our services:", result);
         } catch (error) {
@@ -435,7 +438,7 @@ export default function register(api) {
       .description("Run initial wallet setup")
       .action(async () => {
         try {
-          const config = api.getConfig()?.plugins?.entries?.['bsv-overlay']?.config || {};
+          const config = pluginConfig;
           const env = buildEnvironment(config);
           const cliPath = path.join(__dirname, 'scripts', 'overlay-cli.mjs');
           
@@ -451,7 +454,7 @@ export default function register(api) {
       .description("Register with the overlay network")
       .action(async () => {
         try {
-          const config = api.getConfig()?.plugins?.entries?.['bsv-overlay']?.config || {};
+          const config = pluginConfig;
           const env = buildEnvironment(config);
           const cliPath = path.join(__dirname, 'scripts', 'overlay-cli.mjs');
           
@@ -464,20 +467,25 @@ export default function register(api) {
       });
   }, { commands: ["overlay"] });
 
-  // Auto-setup: ensure wallet exists
-  const config = api.getConfig()?.plugins?.entries?.['bsv-overlay']?.config || {};
-  const walletDir = config?.walletDir || path.join(process.env.HOME || '', '.clawdbot', 'bsv-wallet');
-  const identityFile = path.join(walletDir, 'wallet-identity.json');
-  if (!fs.existsSync(identityFile)) {
-    api.log?.info?.('[bsv-overlay] No wallet found — running auto-setup...');
-    try {
-      const env = buildEnvironment(config || {});
-      const cliPath = path.join(__dirname, 'scripts', 'overlay-cli.mjs');
-      await execFileAsync('node', [cliPath, 'setup'], { env });
-      api.log?.info?.('[bsv-overlay] Wallet initialized. Fund it and run: overlay({ action: "register" })');
-    } catch (err) {
-      api.log?.warn?.('[bsv-overlay] Auto-setup failed:', err.message);
+  // Auto-setup: ensure wallet exists (best-effort, non-fatal)
+  try {
+    const config = pluginConfig;
+    const walletDir = config?.walletDir || path.join(process.env.HOME || '', '.clawdbot', 'bsv-wallet');
+    const identityFile = path.join(walletDir, 'wallet-identity.json');
+    if (!fs.existsSync(identityFile)) {
+      api.log?.info?.('[bsv-overlay] No wallet found — running auto-setup...');
+      try {
+        const env = buildEnvironment(config || {});
+        const cliPath = path.join(__dirname, 'scripts', 'overlay-cli.mjs');
+        await execFileAsync('node', [cliPath, 'setup'], { env });
+        api.log?.info?.('[bsv-overlay] Wallet initialized. Fund it and run: overlay({ action: "register" })');
+      } catch (err: any) {
+        api.log?.warn?.('[bsv-overlay] Auto-setup failed:', err.message);
+      }
     }
+  } catch (err: any) {
+    // Non-fatal — plugin still loads if auto-setup fails
+    api.log?.debug?.('[bsv-overlay] Auto-setup skipped:', err.message);
   }
 }
 
