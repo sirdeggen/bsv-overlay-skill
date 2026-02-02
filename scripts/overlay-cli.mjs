@@ -171,8 +171,16 @@ async function wocFetch(urlPath, options = {}, maxRetries = 3, timeoutMs = 30000
   
   throw lastError || new Error('WoC fetch failed after retries');
 }
-const TOPICS = { IDENTITY: 'tm_clawdbot_identity', SERVICES: 'tm_clawdbot_services' };
-const LOOKUP_SERVICES = { AGENTS: 'ls_clawdbot_agents', SERVICES: 'ls_clawdbot_services' };
+const TOPICS = { 
+  IDENTITY: 'tm_clawdbot_identity', 
+  SERVICES: 'tm_clawdbot_services',
+  X_VERIFICATION: 'tm_clawdbot_x_verification',
+};
+const LOOKUP_SERVICES = { 
+  AGENTS: 'ls_clawdbot_agents', 
+  SERVICES: 'ls_clawdbot_services',
+  X_VERIFICATIONS: 'ls_clawdbot_x_verifications',
+};
 
 // ---------------------------------------------------------------------------
 // JSON output helpers
@@ -1915,6 +1923,210 @@ async function cmdReadvertise(serviceId, newPrice, newName, newDesc) {
 }
 
 // ---------------------------------------------------------------------------
+// X Account Verification Commands
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate a verification message for linking an X account to an overlay identity.
+ * The agent should post this message to X, then call x-verify-complete with the tweet URL.
+ */
+async function cmdXVerifyStart(xHandle) {
+  if (!xHandle) return fail('Usage: x-verify-start <@handle>');
+  
+  // Normalize handle
+  const handle = xHandle.startsWith('@') ? xHandle : `@${xHandle}`;
+  
+  const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
+  if (!fs.existsSync(identityPath)) return fail('Wallet not initialized. Run: overlay-cli setup');
+  
+  const identity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
+  const privKey = PrivateKey.fromHex(identity.rootKeyHex);
+  const identityKey = identity.identityKey;
+  
+  // Create the verification payload
+  const timestamp = new Date().toISOString();
+  const verificationData = {
+    action: 'verify-x-account',
+    identityKey,
+    xHandle: handle,
+    timestamp,
+    protocol: PROTOCOL_ID,
+  };
+  
+  // Sign the verification data
+  const preimage = JSON.stringify(verificationData);
+  const msgHash = Hash.sha256(Array.from(new TextEncoder().encode(preimage)));
+  const sig = privKey.sign(msgHash);
+  const signature = Array.from(sig.toDER()).map(b => b.toString(16).padStart(2, '0')).join('');
+  
+  // Generate the tweet text
+  const tweetText = `Verifying my Claw Overlay identity 🪙
+
+Identity: ${identityKey.slice(0, 16)}...${identityKey.slice(-8)}
+Signature: ${signature.slice(0, 32)}...
+
+Full verification:
+${identityKey}
+${signature}`;
+
+  // Save pending verification
+  const pendingPath = path.join(OVERLAY_STATE_DIR, 'pending-x-verification.json');
+  fs.mkdirSync(OVERLAY_STATE_DIR, { recursive: true });
+  fs.writeFileSync(pendingPath, JSON.stringify({
+    handle,
+    identityKey,
+    timestamp,
+    verificationData,
+    signature,
+    tweetText,
+    createdAt: new Date().toISOString(),
+  }, null, 2));
+  
+  ok({
+    status: 'pending',
+    handle,
+    identityKey,
+    tweetText,
+    instructions: 'Post this text to X from the account you want to verify, then call x-verify-complete with the tweet URL.',
+    signature,
+  });
+}
+
+/**
+ * Complete X verification by checking the posted tweet and storing on-chain.
+ */
+async function cmdXVerifyComplete(tweetUrl) {
+  if (!tweetUrl) return fail('Usage: x-verify-complete <tweet-url>');
+  
+  // Load pending verification
+  const pendingPath = path.join(OVERLAY_STATE_DIR, 'pending-x-verification.json');
+  if (!fs.existsSync(pendingPath)) {
+    return fail('No pending X verification. Run x-verify-start first.');
+  }
+  
+  const pending = JSON.parse(fs.readFileSync(pendingPath, 'utf-8'));
+  
+  // Extract tweet ID from URL
+  const tweetIdMatch = tweetUrl.match(/status\/(\d+)/);
+  if (!tweetIdMatch) return fail('Invalid tweet URL. Expected format: https://x.com/user/status/123456789');
+  const tweetId = tweetIdMatch[1];
+  
+  // Fetch the tweet using bird CLI
+  let tweetData;
+  try {
+    const { execSync } = await import('child_process');
+    const birdOutput = execSync(`bird read ${tweetUrl} --json 2>/dev/null`, { 
+      encoding: 'utf-8',
+      timeout: 30000,
+    });
+    tweetData = JSON.parse(birdOutput);
+  } catch (err) {
+    return fail(`Failed to fetch tweet: ${err.message}. Make sure bird CLI is configured.`);
+  }
+  
+  // Verify the tweet contains our signature
+  const tweetText = tweetData.text || tweetData.full_text || '';
+  if (!tweetText.includes(pending.signature.slice(0, 32))) {
+    return fail('Tweet does not contain the expected verification signature.');
+  }
+  if (!tweetText.includes(pending.identityKey)) {
+    return fail('Tweet does not contain the expected identity key.');
+  }
+  
+  // Get the X user info from the tweet
+  const xUserId = tweetData.user?.id_str || tweetData.author?.id || tweetData.user_id;
+  const xHandle = tweetData.user?.screen_name || tweetData.author?.username || pending.handle.replace('@', '');
+  
+  if (!xUserId) {
+    return fail('Could not extract X user ID from tweet data.');
+  }
+  
+  // Build on-chain verification record
+  const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
+  const identity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
+  
+  const verificationPayload = {
+    protocol: PROTOCOL_ID,
+    type: 'x-verification',
+    identityKey: pending.identityKey,
+    xHandle: `@${xHandle}`,
+    xUserId,
+    tweetId,
+    tweetUrl,
+    signature: pending.signature,
+    verifiedAt: new Date().toISOString(),
+  };
+  
+  // Submit to overlay
+  let result;
+  try {
+    result = await buildRealOverlayTransaction(verificationPayload, TOPICS.X_VERIFICATION);
+  } catch (err) {
+    return fail(`Failed to store verification on-chain: ${err.message}`);
+  }
+  
+  // Save verification locally
+  const verificationsPath = path.join(OVERLAY_STATE_DIR, 'x-verifications.json');
+  let verifications = [];
+  try {
+    if (fs.existsSync(verificationsPath)) {
+      verifications = JSON.parse(fs.readFileSync(verificationsPath, 'utf-8'));
+    }
+  } catch {}
+  
+  verifications.push({
+    ...verificationPayload,
+    txid: result.txid,
+  });
+  fs.writeFileSync(verificationsPath, JSON.stringify(verifications, null, 2));
+  
+  // Clean up pending
+  fs.unlinkSync(pendingPath);
+  
+  ok({
+    verified: true,
+    identityKey: pending.identityKey,
+    xHandle: `@${xHandle}`,
+    xUserId,
+    tweetId,
+    txid: result.txid,
+    funded: result.funded,
+  });
+}
+
+/**
+ * List verified X accounts (local cache).
+ */
+async function cmdXVerifications() {
+  const verificationsPath = path.join(OVERLAY_STATE_DIR, 'x-verifications.json');
+  let verifications = [];
+  try {
+    if (fs.existsSync(verificationsPath)) {
+      verifications = JSON.parse(fs.readFileSync(verificationsPath, 'utf-8'));
+    }
+  } catch {}
+  
+  ok({ verifications, count: verifications.length });
+}
+
+/**
+ * Lookup X verifications from the overlay network.
+ */
+async function cmdXLookup(query) {
+  try {
+    const lookupQuery = query 
+      ? (query.startsWith('@') ? { xHandle: query } : { identityKey: query })
+      : { type: 'list' };
+    
+    const response = await lookupOverlay(LOOKUP_SERVICES.X_VERIFICATIONS, lookupQuery);
+    ok({ verifications: response.outputs || response || [], query: lookupQuery });
+  } catch (err) {
+    // Lookup service might not exist yet
+    ok({ verifications: [], query, note: 'X verification lookup service may not be deployed yet.' });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Discovery commands
 // ---------------------------------------------------------------------------
 
@@ -2390,6 +2602,8 @@ async function processMessage(msg, identityKey, privKey) {
       return await processMemoryStore(msg, identityKey, privKey);
     } else if (serviceId === 'code-develop') {
       return await processCodeDevelop(msg, identityKey, privKey);
+    } else if (serviceId === 'x-engagement') {
+      return await processXEngagement(msg, identityKey, privKey);
     } else {
       // Unknown service — don't auto-process
       return {
@@ -4340,6 +4554,248 @@ async function processJokeRequest(msg, identityKey, privKey) {
 }
 
 // ---------------------------------------------------------------------------
+// Service: x-engagement (provider-set pricing)
+// ---------------------------------------------------------------------------
+
+/**
+ * Process X engagement requests (likes, retweets).
+ * Requirements:
+ * - Provider must have verified X account (x-verifications.json)
+ * - Provider must have bird CLI configured with cookies
+ */
+async function processXEngagement(msg, identityKey, privKey) {
+  const input = msg.payload?.input || msg.payload;
+  const payment = msg.payload?.payment;
+  
+  // Load provider's verified X accounts
+  const verificationsPath = path.join(OVERLAY_STATE_DIR, 'x-verifications.json');
+  let verifications = [];
+  try {
+    if (fs.existsSync(verificationsPath)) {
+      verifications = JSON.parse(fs.readFileSync(verificationsPath, 'utf-8'));
+    }
+  } catch {}
+  
+  if (verifications.length === 0) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'x-engagement',
+      status: 'rejected',
+      reason: 'Provider has no verified X account. Cannot fulfill engagement requests.',
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'x-engagement', action: 'rejected', reason: 'no verified x account', from: msg.from, ack: true };
+  }
+  
+  // Validate input
+  const action = input?.action; // 'like' or 'retweet'
+  const tweetUrl = input?.tweetUrl || input?.url;
+  
+  if (!action || !['like', 'retweet', 'rt'].includes(action.toLowerCase())) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'x-engagement',
+      status: 'rejected',
+      reason: 'Invalid action. Send {action: "like" | "retweet", tweetUrl: "https://x.com/..."}',
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'x-engagement', action: 'rejected', reason: 'invalid action', from: msg.from, ack: true };
+  }
+  
+  if (!tweetUrl || !tweetUrl.includes('/status/')) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'x-engagement',
+      status: 'rejected',
+      reason: 'Invalid or missing tweetUrl. Expected format: https://x.com/user/status/123456789',
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'x-engagement', action: 'rejected', reason: 'invalid tweet url', from: msg.from, ack: true };
+  }
+  
+  // Load service price from local services
+  const services = loadServices();
+  const xEngagementService = services.find(s => s.serviceId === 'x-engagement');
+  const PRICE = xEngagementService?.priceSats || 10; // Default 10 sats if not advertised
+  
+  // Verify payment
+  const walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
+  const payResult = await verifyAndAcceptPayment(payment, PRICE, msg.from, 'x-engagement', ourHash160);
+  
+  if (!payResult.accepted) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'x-engagement',
+      status: 'rejected',
+      reason: `Payment rejected: ${payResult.error}. X engagement costs ${PRICE} sats.`,
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'x-engagement', action: 'rejected', reason: payResult.error, from: msg.from, ack: true };
+  }
+  
+  // Perform the engagement action using bird CLI
+  const normalizedAction = action.toLowerCase() === 'rt' ? 'retweet' : action.toLowerCase();
+  let engagementResult;
+  let verified = false;
+  
+  try {
+    const { execSync } = await import('child_process');
+    
+    if (normalizedAction === 'like') {
+      // bird doesn't have a direct like command, we'll use the API approach
+      // For now, return that likes require browser automation
+      // TODO: Add bird like support when available
+      engagementResult = { 
+        success: false, 
+        error: 'Like action requires browser automation. Feature coming soon.',
+        note: 'Consider requesting retweet instead.',
+      };
+    } else if (normalizedAction === 'retweet') {
+      // bird doesn't have a direct retweet command either
+      // TODO: Add bird retweet support when available
+      engagementResult = { 
+        success: false, 
+        error: 'Retweet action requires browser automation. Feature coming soon.',
+        note: 'Manual fulfillment required.',
+      };
+    }
+    
+    // Since bird CLI doesn't support like/retweet yet, we'll queue for manual fulfillment
+    // In the future, this will use browser automation or bird extensions
+    
+    // For now, mark as pending manual action
+    const queuePath = path.join(OVERLAY_STATE_DIR, 'x-engagement-queue.jsonl');
+    const queueEntry = {
+      requestId: msg.id,
+      from: msg.from,
+      action: normalizedAction,
+      tweetUrl,
+      paymentTxid: payResult.txid,
+      satoshisReceived: payResult.satoshis,
+      queuedAt: new Date().toISOString(),
+      status: 'pending',
+    };
+    fs.appendFileSync(queuePath, JSON.stringify(queueEntry) + '\n');
+    
+    engagementResult = {
+      success: true,
+      queued: true,
+      note: 'Engagement request queued. Provider will fulfill shortly.',
+    };
+    
+  } catch (err) {
+    engagementResult = { success: false, error: err.message };
+  }
+  
+  // Send response
+  const responsePayload = {
+    requestId: msg.id,
+    serviceId: 'x-engagement',
+    status: engagementResult.success ? 'fulfilled' : 'partial',
+    result: {
+      action: normalizedAction,
+      tweetUrl,
+      ...engagementResult,
+      providerXAccount: verifications[0]?.xHandle,
+    },
+    paymentAccepted: true,
+    paymentTxid: payResult.txid,
+    satoshisReceived: payResult.satoshis,
+    walletAccepted: payResult.walletAccepted,
+  };
+  
+  const respSig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
+  await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: responsePayload, signature: respSig }),
+  });
+  
+  return {
+    id: msg.id, type: 'service-request', serviceId: 'x-engagement',
+    action: engagementResult.success ? 'fulfilled' : 'partial',
+    result: engagementResult,
+    paymentAccepted: true, paymentTxid: payResult.txid,
+    satoshisReceived: payResult.satoshis, walletAccepted: payResult.walletAccepted,
+    from: msg.from, ack: true,
+  };
+}
+
+/**
+ * Process the X engagement queue (for manual fulfillment).
+ */
+async function cmdXEngagementQueue() {
+  const queuePath = path.join(OVERLAY_STATE_DIR, 'x-engagement-queue.jsonl');
+  if (!fs.existsSync(queuePath)) {
+    return ok({ queue: [], count: 0 });
+  }
+  
+  const lines = fs.readFileSync(queuePath, 'utf-8').split('\n').filter(l => l.trim());
+  const queue = lines.map(l => {
+    try { return JSON.parse(l); } catch { return null; }
+  }).filter(Boolean).filter(e => e.status === 'pending');
+  
+  ok({ queue, count: queue.length });
+}
+
+/**
+ * Mark an X engagement request as fulfilled.
+ */
+async function cmdXEngagementFulfill(requestId, proofUrl) {
+  if (!requestId) return fail('Usage: x-engagement-fulfill <requestId> [proofUrl]');
+  
+  const queuePath = path.join(OVERLAY_STATE_DIR, 'x-engagement-queue.jsonl');
+  if (!fs.existsSync(queuePath)) {
+    return fail('No engagement queue found.');
+  }
+  
+  const lines = fs.readFileSync(queuePath, 'utf-8').split('\n').filter(l => l.trim());
+  const queue = lines.map(l => {
+    try { return JSON.parse(l); } catch { return null; }
+  }).filter(Boolean);
+  
+  const entryIndex = queue.findIndex(e => e.requestId === requestId);
+  if (entryIndex === -1) {
+    return fail(`Request ${requestId} not found in queue.`);
+  }
+  
+  // Mark as fulfilled
+  queue[entryIndex].status = 'fulfilled';
+  queue[entryIndex].fulfilledAt = new Date().toISOString();
+  queue[entryIndex].proofUrl = proofUrl || null;
+  
+  // Rewrite queue file
+  fs.writeFileSync(queuePath, queue.map(e => JSON.stringify(e)).join('\n') + '\n');
+  
+  ok({
+    fulfilled: true,
+    requestId,
+    entry: queue[entryIndex],
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Poll command — uses shared processMessage
 // ---------------------------------------------------------------------------
 
@@ -4770,10 +5226,21 @@ try {
     case 'service-queue':     await cmdServiceQueue(); break;
     case 'respond-service':   await cmdRespondService(args[0], args[1], args[2], args.slice(3).join(' ')); break;
 
+    // X Account Verification
+    case 'x-verify-start':      await cmdXVerifyStart(args[0]); break;
+    case 'x-verify-complete':   await cmdXVerifyComplete(args[0]); break;
+    case 'x-verifications':     await cmdXVerifications(); break;
+    case 'x-lookup':            await cmdXLookup(args[0]); break;
+
+    // X Engagement Service
+    case 'x-engagement-queue':    await cmdXEngagementQueue(); break;
+    case 'x-engagement-fulfill':  await cmdXEngagementFulfill(args[0], args[1]); break;
+
     default:
       fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, ` +
            `services, advertise, readvertise, remove, discover, pay, verify, accept, send, inbox, ack, poll, connect, ` +
-           `request-service, research-queue, research-respond, service-queue, respond-service`);
+           `request-service, research-queue, research-respond, service-queue, respond-service, ` +
+           `x-verify-start, x-verify-complete, x-verifications, x-lookup, x-engagement-queue, x-engagement-fulfill`);
   }
 } catch (err) {
   fail(err instanceof Error ? err.message : String(err));

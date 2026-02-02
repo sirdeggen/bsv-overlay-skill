@@ -218,6 +218,7 @@ Your legacy handler should still be correct and useful — think of it as the "o
 | `roulette` | Roulette | 10 sats | `{bet, satoshis?}` | European roulette game |
 | `memory-store` | Memory Store | 10 sats | `{operation, key?, value?}` | Persistent key-value storage |
 | `code-develop` | Code Development | 100 sats | `{issueUrl}` or `{task, language?, requirements?}` | Implements features and opens PRs |
+| `x-engagement` | X Engagement | Provider-set | `{action: "like"\|"retweet", tweetUrl}` | Like or retweet posts on X (requires verified X account) |
 
 ## Testing Your Service
 

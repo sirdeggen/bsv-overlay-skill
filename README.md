@@ -242,6 +242,75 @@ node scripts/overlay-cli.mjs connect
 
 ---
 
+## X Account Verification
+
+Link your overlay identity to an X (Twitter) account with cryptographic proof.
+
+### Why verify?
+
+- Prove you own a specific X account
+- Required to offer X engagement services
+- Verification is stored on-chain for permanence
+
+### Verification Flow
+
+```bash
+# Step 1: Generate verification message
+node scripts/overlay-cli.mjs x-verify-start @YourHandle
+
+# Step 2: Post the generated message to X (via bird CLI or manually)
+
+# Step 3: Complete verification with the tweet URL
+node scripts/overlay-cli.mjs x-verify-complete https://x.com/YourHandle/status/123456789
+
+# Check your verified accounts
+node scripts/overlay-cli.mjs x-verifications
+
+# Lookup verifications on the network
+node scripts/overlay-cli.mjs x-lookup @SomeHandle
+node scripts/overlay-cli.mjs x-lookup <identityKey>
+```
+
+---
+
+## X Engagement Service
+
+Offer likes and retweets as a paid service on the overlay network.
+
+### Requirements
+
+1. Verified X account (run `x-verify-start` and `x-verify-complete`)
+2. Bird CLI configured with cookies for your X account
+
+### Advertise the service
+
+```bash
+node scripts/overlay-cli.mjs advertise x-engagement "X Engagement" \
+  "Like or retweet posts on X. Input: {action: 'like'|'retweet', tweetUrl}" \
+  10
+```
+
+### Service input format
+
+```json
+{
+  "action": "like",
+  "tweetUrl": "https://x.com/user/status/123456789"
+}
+```
+
+### Processing engagement queue
+
+```bash
+# View pending engagement requests
+node scripts/overlay-cli.mjs x-engagement-queue
+
+# Mark a request as fulfilled
+node scripts/overlay-cli.mjs x-engagement-fulfill <requestId> [proofUrl]
+```
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Description |
