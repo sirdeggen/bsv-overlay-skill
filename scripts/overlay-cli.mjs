@@ -1533,7 +1533,61 @@ async function cmdRegister() {
 }
 
 async function cmdUnregister() {
-  fail('unregister is not yet implemented. Remove your agent by spending the identity UTXO.');
+  const reg = loadRegistration();
+  if (!reg) return fail('No registration found. Nothing to unregister.');
+
+  const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
+  if (!fs.existsSync(identityPath)) return fail('Wallet not initialized. Run: overlay-cli setup');
+
+  const identity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
+
+  // --- Step 1: Submit identity-delete tombstone ---
+  const deletePayload = {
+    protocol: PROTOCOL_ID,
+    type: 'identity-delete',
+    identityKey: identity.identityKey,
+    previousTxid: reg.identityTxid || null,
+    timestamp: new Date().toISOString(),
+  };
+
+  let deleteResult;
+  try {
+    deleteResult = await buildRealOverlayTransaction(deletePayload, TOPICS.IDENTITY);
+  } catch (err) {
+    return fail(`Identity unregister failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // --- Step 2: Submit service-delete tombstones for all registered services ---
+  const services = loadServices();
+  const serviceDeleteResults = [];
+  for (const svc of services) {
+    const svcDeletePayload = {
+      protocol: PROTOCOL_ID,
+      type: 'service-delete',
+      identityKey: identity.identityKey,
+      serviceId: svc.serviceId,
+      previousTxid: svc.txid || null,
+      timestamp: new Date().toISOString(),
+    };
+    try {
+      const svcResult = await buildRealOverlayTransaction(svcDeletePayload, TOPICS.SERVICES);
+      serviceDeleteResults.push({ serviceId: svc.serviceId, txid: svcResult.txid, success: true });
+    } catch (err) {
+      serviceDeleteResults.push({ serviceId: svc.serviceId, success: false, error: String(err) });
+    }
+  }
+
+  // --- Step 3: Clean up local state ---
+  const regFile = path.join(OVERLAY_STATE_DIR, 'registration.json');
+  try { fs.unlinkSync(regFile); } catch {}
+  saveServices([]);
+
+  ok({
+    unregistered: true,
+    identityKey: identity.identityKey,
+    identityDeleteTxid: deleteResult.txid,
+    serviceDeletes: serviceDeleteResults,
+  });
 }
 
 async function cmdServices() {
@@ -1599,18 +1653,44 @@ async function cmdAdvertise(serviceId, name, description, priceSats) {
 async function cmdRemove(serviceId) {
   if (!serviceId) return fail('Usage: remove <serviceId>');
 
-  // Remove from local list
+  const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
+  if (!fs.existsSync(identityPath)) return fail('Wallet not initialized. Run: overlay-cli setup');
+
+  const identity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
+
+  // Find service in local list
   const services = loadServices();
   const idx = services.findIndex(s => s.serviceId === serviceId);
   if (idx < 0) return fail(`Service '${serviceId}' not found in local registry`);
 
-  const removed = services.splice(idx, 1)[0];
+  const removed = services[idx];
+
+  // Submit service-delete tombstone to overlay
+  const deletePayload = {
+    protocol: PROTOCOL_ID,
+    type: 'service-delete',
+    identityKey: identity.identityKey,
+    serviceId,
+    previousTxid: removed.txid || null,
+    timestamp: new Date().toISOString(),
+  };
+
+  let deleteResult;
+  try {
+    deleteResult = await buildRealOverlayTransaction(deletePayload, TOPICS.SERVICES);
+  } catch (err) {
+    return fail(`Service removal failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // Remove from local list
+  services.splice(idx, 1);
   saveServices(services);
 
   ok({
     removed: true,
     serviceId,
-    note: 'Removed from local registry. On-chain record remains until UTXO is spent.',
+    deleteTxid: deleteResult.txid,
+    funded: deleteResult.funded,
     previousTxid: removed.txid,
   });
 }

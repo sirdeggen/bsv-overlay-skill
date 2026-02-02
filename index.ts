@@ -12,6 +12,9 @@ const execFileAsync = promisify(execFile);
 let backgroundProcess: ChildProcess | null = null;
 let serviceRunning = false;
 
+// Confirmation tokens for destructive actions — maps token → { action, details, expiresAt }
+const pendingConfirmations: Map<string, { action: string; details: any; expiresAt: number }> = new Map();
+
 // Auto-import tracking
 let autoImportInterval: any = null;
 let knownTxids: Set<string> = new Set();
@@ -360,7 +363,8 @@ export default function register(api) {
             "request", "discover", "balance", "status", "pay", 
             "setup", "address", "import", "register", "advertise", 
             "readvertise", "remove", "send", "inbox", "services", "refund",
-            "onboard", "pending-requests", "fulfill"
+            "onboard", "pending-requests", "fulfill",
+            "unregister", "remove-service"
           ],
           description: "Action to perform"
         },
@@ -438,6 +442,11 @@ export default function register(api) {
         address: {
           type: "string",
           description: "Destination address for refund"
+        },
+        // Confirmation token for destructive actions (unregister, remove-service)
+        confirmToken: {
+          type: "string",
+          description: "Confirmation token from a previous preview call — required to execute destructive actions"
         },
         // Fulfill parameters
         requestId: {
@@ -727,6 +736,12 @@ async function executeOverlayAction(params, config, api) {
     case "fulfill":
       return await handleFulfill(params, env, cliPath);
     
+    case "unregister":
+      return await handleUnregister(params, env, cliPath);
+
+    case "remove-service":
+      return await handleRemoveService(params, env, cliPath);
+    
     default:
       throw new Error(`Unknown action: ${action}`);
   }
@@ -823,6 +838,179 @@ async function handleServiceRequest(params, env, cliPath, config, api) {
     status: "sent",
     requestId: requestOutput.data?.messageId,
     message: `Request sent and paid (${price} sats) to ${bestProvider.name}. The response will be delivered asynchronously when the provider fulfills it.`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Confirmation-gated destructive actions
+// ---------------------------------------------------------------------------
+
+function generateConfirmToken(): string {
+  return `confirm-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function cleanExpiredTokens() {
+  const now = Date.now();
+  for (const [token, entry] of pendingConfirmations) {
+    if (entry.expiresAt < now) pendingConfirmations.delete(token);
+  }
+}
+
+function validateConfirmToken(token: string, expectedAction: string): { valid: boolean; details?: any; error?: string } {
+  cleanExpiredTokens();
+  const entry = pendingConfirmations.get(token);
+  if (!entry) return { valid: false, error: 'Invalid or expired confirmation token. Run the action without confirmToken first to get a preview and new token.' };
+  if (entry.action !== expectedAction) return { valid: false, error: `Token is for action '${entry.action}', not '${expectedAction}'.` };
+  pendingConfirmations.delete(token); // one-time use
+  return { valid: true, details: entry.details };
+}
+
+async function handleUnregister(params, env, cliPath) {
+  const { confirmToken } = params;
+
+  // Load current registration to show what will be deleted
+  const regPath = path.join(process.env.HOME || '', '.clawdbot', 'bsv-overlay', 'registration.json');
+  let registration: any = null;
+  try {
+    if (fs.existsSync(regPath)) {
+      registration = JSON.parse(fs.readFileSync(regPath, 'utf-8'));
+    }
+  } catch {}
+
+  if (!registration) {
+    throw new Error('No registration found — agent is not registered on the overlay network.');
+  }
+
+  // Load services that will also become orphaned
+  const servicesResult = await execFileAsync('node', [cliPath, 'services'], { env });
+  const servicesOutput = parseCliOutput(servicesResult.stdout);
+  const services = servicesOutput?.data?.services || [];
+
+  // Step 1: No token → preview + generate confirmation token
+  if (!confirmToken) {
+    const token = generateConfirmToken();
+    pendingConfirmations.set(token, {
+      action: 'unregister',
+      details: { registration, services },
+      expiresAt: Date.now() + 5 * 60 * 1000, // 5 minute expiry
+    });
+
+    return {
+      status: 'confirmation_required',
+      confirmToken: token,
+      warning: '⚠️ DESTRUCTIVE ACTION — This will remove the agent from the overlay network.',
+      message: 'You MUST get explicit human confirmation before proceeding. Show the user what will be deleted and ask them to confirm.',
+      willDelete: {
+        identity: {
+          name: registration.name || registration.agentName,
+          identityKey: registration.identityKey,
+          txid: registration.txid,
+          registeredAt: registration.registeredAt || registration.timestamp,
+        },
+        services: services.map((s: any) => ({
+          serviceId: s.serviceId,
+          name: s.name,
+          priceSats: s.priceSats,
+          txid: s.txid,
+        })),
+        serviceCount: services.length,
+      },
+      instructions: `To confirm: call overlay({ action: "unregister", confirmToken: "${token}" }). Token expires in 5 minutes.`,
+    };
+  }
+
+  // Step 2: Token provided → validate and execute
+  const validation = validateConfirmToken(confirmToken, 'unregister');
+  if (!validation.valid) {
+    throw new Error(validation.error!);
+  }
+
+  // Execute the unregister via CLI
+  const result = await execFileAsync('node', [cliPath, 'unregister'], { env, timeout: 60000 });
+  const output = parseCliOutput(result.stdout);
+
+  if (!output.success) {
+    throw new Error(`Unregister failed: ${output.error}`);
+  }
+
+  writeActivityEvent({
+    type: 'agent_unregistered', emoji: '🗑️',
+    message: `Agent unregistered from overlay network. Identity and ${services.length} services removed.`,
+  });
+
+  return {
+    status: 'unregistered',
+    message: `Agent has been removed from the overlay network. ${services.length} service(s) are no longer discoverable.`,
+    ...output.data,
+  };
+}
+
+async function handleRemoveService(params, env, cliPath) {
+  const { serviceId, confirmToken } = params;
+
+  if (!serviceId) {
+    throw new Error('serviceId is required for remove-service action');
+  }
+
+  // Load the service details
+  const servicesResult = await execFileAsync('node', [cliPath, 'services'], { env });
+  const servicesOutput = parseCliOutput(servicesResult.stdout);
+  const services = servicesOutput?.data?.services || [];
+  const target = services.find((s: any) => s.serviceId === serviceId);
+
+  if (!target) {
+    throw new Error(`Service '${serviceId}' not found in local registry. Available: ${services.map((s: any) => s.serviceId).join(', ')}`);
+  }
+
+  // Step 1: No token → preview + generate confirmation token
+  if (!confirmToken) {
+    const token = generateConfirmToken();
+    pendingConfirmations.set(token, {
+      action: 'remove-service',
+      details: { serviceId, target },
+      expiresAt: Date.now() + 5 * 60 * 1000,
+    });
+
+    return {
+      status: 'confirmation_required',
+      confirmToken: token,
+      warning: `⚠️ DESTRUCTIVE ACTION — This will remove the '${serviceId}' service from the overlay network.`,
+      message: 'You MUST get explicit human confirmation before proceeding. Show the user what will be deleted and ask them to confirm.',
+      willDelete: {
+        serviceId: target.serviceId,
+        name: target.name,
+        description: target.description,
+        priceSats: target.priceSats,
+        txid: target.txid,
+        registeredAt: target.registeredAt,
+      },
+      instructions: `To confirm: call overlay({ action: "remove-service", serviceId: "${serviceId}", confirmToken: "${token}" }). Token expires in 5 minutes.`,
+    };
+  }
+
+  // Step 2: Token provided → validate and execute
+  const validation = validateConfirmToken(confirmToken, 'remove-service');
+  if (!validation.valid) {
+    throw new Error(validation.error!);
+  }
+
+  // Execute the remove via CLI (which now does on-chain deletion)
+  const result = await execFileAsync('node', [cliPath, 'remove', serviceId], { env, timeout: 60000 });
+  const output = parseCliOutput(result.stdout);
+
+  if (!output.success) {
+    throw new Error(`Remove service failed: ${output.error}`);
+  }
+
+  writeActivityEvent({
+    type: 'service_removed', emoji: '🗑️',
+    serviceId, message: `Service '${serviceId}' removed from overlay network.`,
+  });
+
+  return {
+    status: 'removed',
+    message: `Service '${serviceId}' has been removed from the overlay network and is no longer discoverable.`,
+    ...output.data,
   };
 }
 
