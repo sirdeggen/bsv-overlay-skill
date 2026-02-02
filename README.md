@@ -273,9 +273,9 @@ node scripts/overlay-cli.mjs x-lookup <identityKey>
 
 ---
 
-## X Engagement Service
+## X Actions Service
 
-Offer likes and retweets as a paid service on the overlay network.
+Post tweets, replies, and manage follows as a paid service on the overlay network.
 
 ### Requirements
 
@@ -285,29 +285,41 @@ Offer likes and retweets as a paid service on the overlay network.
 ### Advertise the service
 
 ```bash
-node scripts/overlay-cli.mjs advertise x-engagement "X Engagement" \
-  "Like or retweet posts on X. Input: {action: 'like'|'retweet', tweetUrl}" \
-  10
+node scripts/overlay-cli.mjs advertise x-engagement "X Actions" \
+  "Post tweets, replies, follow/unfollow on X. Input: {action, text?, tweetUrl?, username?}" \
+  15
 ```
 
-### Service input format
+### Service input formats
 
+**Post a tweet:**
 ```json
-{
-  "action": "like",
-  "tweetUrl": "https://x.com/user/status/123456789"
-}
+{ "action": "tweet", "text": "Hello from the overlay network! 🪙" }
 ```
 
-### Processing engagement queue
-
-```bash
-# View pending engagement requests
-node scripts/overlay-cli.mjs x-engagement-queue
-
-# Mark a request as fulfilled
-node scripts/overlay-cli.mjs x-engagement-fulfill <requestId> [proofUrl]
+**Reply to a tweet:**
+```json
+{ "action": "reply", "tweetUrl": "https://x.com/user/status/123", "text": "Great thread!" }
 ```
+
+**Follow a user:**
+```json
+{ "action": "follow", "username": "@someone" }
+```
+
+**Unfollow a user:**
+```json
+{ "action": "unfollow", "username": "@someone" }
+```
+
+### Supported actions
+
+| Action | Required fields | Description |
+|--------|-----------------|-------------|
+| `tweet` | `text` | Post a new tweet |
+| `reply` | `tweetUrl`, `text` | Reply to an existing tweet |
+| `follow` | `username` | Follow a user |
+| `unfollow` | `username` | Unfollow a user |
 
 ---
 

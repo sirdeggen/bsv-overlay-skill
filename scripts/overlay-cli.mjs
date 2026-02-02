@@ -4565,7 +4565,8 @@ async function processJokeRequest(msg, identityKey, privKey) {
 // ---------------------------------------------------------------------------
 
 /**
- * Process X engagement requests (likes, retweets).
+ * Process X engagement requests (tweet, reply, follow, unfollow).
+ * These are the actions bird CLI actually supports.
  * Requirements:
  * - Provider must have verified X account (x-verifications.json)
  * - Provider must have bird CLI configured with cookies
@@ -4599,16 +4600,16 @@ async function processXEngagement(msg, identityKey, privKey) {
     return { id: msg.id, type: 'service-request', serviceId: 'x-engagement', action: 'rejected', reason: 'no verified x account', from: msg.from, ack: true };
   }
   
-  // Validate input
-  const action = input?.action; // 'like' or 'retweet'
-  const tweetUrl = input?.tweetUrl || input?.url;
+  // Validate input - supported actions: tweet, reply, follow, unfollow
+  const action = input?.action?.toLowerCase();
+  const VALID_ACTIONS = ['tweet', 'reply', 'follow', 'unfollow'];
   
-  if (!action || !['like', 'retweet', 'rt'].includes(action.toLowerCase())) {
+  if (!action || !VALID_ACTIONS.includes(action)) {
     const rejectPayload = {
       requestId: msg.id,
       serviceId: 'x-engagement',
       status: 'rejected',
-      reason: 'Invalid action. Send {action: "like" | "retweet", tweetUrl: "https://x.com/..."}',
+      reason: `Invalid action "${action || 'none'}". Supported: tweet, reply, follow, unfollow`,
     };
     const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
     await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
@@ -4619,12 +4620,17 @@ async function processXEngagement(msg, identityKey, privKey) {
     return { id: msg.id, type: 'service-request', serviceId: 'x-engagement', action: 'rejected', reason: 'invalid action', from: msg.from, ack: true };
   }
   
-  if (!tweetUrl || !tweetUrl.includes('/status/')) {
+  // Validate action-specific inputs
+  const text = input?.text;
+  const tweetUrl = input?.tweetUrl || input?.url;
+  const username = input?.username || input?.handle || input?.user;
+  
+  if ((action === 'tweet') && !text) {
     const rejectPayload = {
       requestId: msg.id,
       serviceId: 'x-engagement',
       status: 'rejected',
-      reason: 'Invalid or missing tweetUrl. Expected format: https://x.com/user/status/123456789',
+      reason: 'Tweet action requires text. Send {action: "tweet", text: "Your tweet content"}',
     };
     const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
     await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
@@ -4632,7 +4638,39 @@ async function processXEngagement(msg, identityKey, privKey) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
     });
-    return { id: msg.id, type: 'service-request', serviceId: 'x-engagement', action: 'rejected', reason: 'invalid tweet url', from: msg.from, ack: true };
+    return { id: msg.id, type: 'service-request', serviceId: 'x-engagement', action: 'rejected', reason: 'missing text', from: msg.from, ack: true };
+  }
+  
+  if ((action === 'reply') && (!tweetUrl || !text)) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'x-engagement',
+      status: 'rejected',
+      reason: 'Reply action requires tweetUrl and text. Send {action: "reply", tweetUrl: "https://x.com/.../status/...", text: "Your reply"}',
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'x-engagement', action: 'rejected', reason: 'missing tweetUrl or text', from: msg.from, ack: true };
+  }
+  
+  if ((action === 'follow' || action === 'unfollow') && !username) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'x-engagement',
+      status: 'rejected',
+      reason: `${action} action requires username. Send {action: "${action}", username: "@handle"}`,
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'x-engagement', action: 'rejected', reason: 'missing username', from: msg.from, ack: true };
   }
   
   // Load service price from local services
@@ -4660,72 +4698,68 @@ async function processXEngagement(msg, identityKey, privKey) {
     });
     return { id: msg.id, type: 'service-request', serviceId: 'x-engagement', action: 'rejected', reason: payResult.error, from: msg.from, ack: true };
   }
-  
+
   // Perform the engagement action using bird CLI
-  const normalizedAction = action.toLowerCase() === 'rt' ? 'retweet' : action.toLowerCase();
   let engagementResult;
-  let verified = false;
   
   try {
     const { execSync } = await import('child_process');
     
-    if (normalizedAction === 'like') {
-      // bird doesn't have a direct like command, we'll use the API approach
-      // For now, return that likes require browser automation
-      // TODO: Add bird like support when available
-      engagementResult = { 
-        success: false, 
-        error: 'Like action requires browser automation. Feature coming soon.',
-        note: 'Consider requesting retweet instead.',
-      };
-    } else if (normalizedAction === 'retweet') {
-      // bird doesn't have a direct retweet command either
-      // TODO: Add bird retweet support when available
-      engagementResult = { 
-        success: false, 
-        error: 'Retweet action requires browser automation. Feature coming soon.',
-        note: 'Manual fulfillment required.',
-      };
+    // Build bird command with auth from environment or config
+    const birdEnv = { ...process.env };
+    
+    // Escape shell arguments safely
+    const shellEscape = (str) => `'${str.replace(/'/g, "'\\''")}'`;
+    
+    let birdCmd;
+    let resultData = {};
+    
+    if (action === 'tweet') {
+      birdCmd = `bird tweet ${shellEscape(text)}`;
+      resultData = { action: 'tweet', text };
+    } else if (action === 'reply') {
+      birdCmd = `bird reply ${shellEscape(tweetUrl)} ${shellEscape(text)}`;
+      resultData = { action: 'reply', tweetUrl, text };
+    } else if (action === 'follow') {
+      const cleanUsername = username.replace(/^@/, '');
+      birdCmd = `bird follow ${shellEscape(cleanUsername)}`;
+      resultData = { action: 'follow', username: cleanUsername };
+    } else if (action === 'unfollow') {
+      const cleanUsername = username.replace(/^@/, '');
+      birdCmd = `bird unfollow ${shellEscape(cleanUsername)}`;
+      resultData = { action: 'unfollow', username: cleanUsername };
     }
     
-    // Since bird CLI doesn't support like/retweet yet, we'll queue for manual fulfillment
-    // In the future, this will use browser automation or bird extensions
-    
-    // For now, mark as pending manual action
-    const queuePath = path.join(OVERLAY_STATE_DIR, 'x-engagement-queue.jsonl');
-    const queueEntry = {
-      requestId: msg.id,
-      from: msg.from,
-      action: normalizedAction,
-      tweetUrl,
-      paymentTxid: payResult.txid,
-      satoshisReceived: payResult.satoshis,
-      queuedAt: new Date().toISOString(),
-      status: 'pending',
-    };
-    fs.appendFileSync(queuePath, JSON.stringify(queueEntry) + '\n');
+    // Execute bird command
+    const output = execSync(birdCmd, { 
+      encoding: 'utf-8', 
+      env: birdEnv,
+      timeout: 30000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
     
     engagementResult = {
       success: true,
-      queued: true,
-      note: 'Engagement request queued. Provider will fulfill shortly.',
+      ...resultData,
+      output: output.trim(),
+      providerXAccount: verifications[0]?.xHandle,
     };
     
   } catch (err) {
-    engagementResult = { success: false, error: err.message };
+    engagementResult = { 
+      success: false, 
+      action,
+      error: err.message,
+      stderr: err.stderr?.toString() || '',
+    };
   }
   
   // Send response
   const responsePayload = {
     requestId: msg.id,
     serviceId: 'x-engagement',
-    status: engagementResult.success ? 'fulfilled' : 'partial',
-    result: {
-      action: normalizedAction,
-      tweetUrl,
-      ...engagementResult,
-      providerXAccount: verifications[0]?.xHandle,
-    },
+    status: engagementResult.success ? 'fulfilled' : 'failed',
+    result: engagementResult,
     paymentAccepted: true,
     paymentTxid: payResult.txid,
     satoshisReceived: payResult.satoshis,
@@ -4741,7 +4775,7 @@ async function processXEngagement(msg, identityKey, privKey) {
   
   return {
     id: msg.id, type: 'service-request', serviceId: 'x-engagement',
-    action: engagementResult.success ? 'fulfilled' : 'partial',
+    action: engagementResult.success ? 'fulfilled' : 'failed',
     result: engagementResult,
     paymentAccepted: true, paymentTxid: payResult.txid,
     satoshisReceived: payResult.satoshis, walletAccepted: payResult.walletAccepted,
@@ -4749,9 +4783,6 @@ async function processXEngagement(msg, identityKey, privKey) {
   };
 }
 
-/**
- * Process the X engagement queue (for manual fulfillment).
- */
 async function cmdXEngagementQueue() {
   const queuePath = path.join(OVERLAY_STATE_DIR, 'x-engagement-queue.jsonl');
   if (!fs.existsSync(queuePath)) {
