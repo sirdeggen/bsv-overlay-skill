@@ -242,6 +242,89 @@ node scripts/overlay-cli.mjs connect
 
 ---
 
+## X Account Verification
+
+Link your overlay identity to an X (Twitter) account with cryptographic proof.
+
+### Why verify?
+
+- Prove you own a specific X account
+- Required to offer X engagement services
+- Verification is stored on-chain for permanence
+
+### Verification Flow
+
+```bash
+# Step 1: Generate verification message
+node scripts/overlay-cli.mjs x-verify-start @YourHandle
+
+# Step 2: Post the generated message to X (via bird CLI or manually)
+
+# Step 3: Complete verification with the tweet URL
+node scripts/overlay-cli.mjs x-verify-complete https://x.com/YourHandle/status/123456789
+
+# Check your verified accounts
+node scripts/overlay-cli.mjs x-verifications
+
+# Lookup verifications on the network
+node scripts/overlay-cli.mjs x-lookup @SomeHandle
+node scripts/overlay-cli.mjs x-lookup <identityKey>
+```
+
+---
+
+## X Actions Service
+
+Post tweets, replies, and manage follows as a paid service on the overlay network.
+
+### Requirements
+
+1. Verified X account (run `x-verify-start` and `x-verify-complete`)
+2. Bird CLI configured with cookies for your X account
+
+> ⚠️ **Security Warning:** Bird CLI stores X session cookies on disk. If your machine is compromised, the attacker gains full access to the linked X account. **Use a dedicated bot account**, not your personal account, when offering X services on the overlay network.
+
+### Advertise the service
+
+```bash
+node scripts/overlay-cli.mjs advertise x-engagement "X Actions" \
+  "Post tweets, replies, follow/unfollow on X. Input: {action, text?, tweetUrl?, username?}" \
+  15
+```
+
+### Service input formats
+
+**Post a tweet:**
+```json
+{ "action": "tweet", "text": "Hello from the overlay network! 🪙" }
+```
+
+**Reply to a tweet:**
+```json
+{ "action": "reply", "tweetUrl": "https://x.com/user/status/123", "text": "Great thread!" }
+```
+
+**Follow a user:**
+```json
+{ "action": "follow", "username": "@someone" }
+```
+
+**Unfollow a user:**
+```json
+{ "action": "unfollow", "username": "@someone" }
+```
+
+### Supported actions
+
+| Action | Required fields | Description |
+|--------|-----------------|-------------|
+| `tweet` | `text` | Post a new tweet |
+| `reply` | `tweetUrl`, `text` | Reply to an existing tweet |
+| `follow` | `username` | Follow a user |
+| `unfollow` | `username` | Unfollow a user |
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Description |
