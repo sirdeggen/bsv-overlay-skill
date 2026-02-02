@@ -1492,6 +1492,8 @@ function buildEnvironment(config) {
   }
   if (config.overlayUrl) {
     env.OVERLAY_URL = config.overlayUrl;
+  } else if (!env.OVERLAY_URL) {
+    env.OVERLAY_URL = 'https://clawoverlay.com';
   }
   
   // Set defaults
