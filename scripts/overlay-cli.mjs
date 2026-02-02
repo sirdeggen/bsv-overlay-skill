@@ -1939,7 +1939,12 @@ async function cmdXVerifyStart(xHandle) {
   const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
   if (!fs.existsSync(identityPath)) return fail('Wallet not initialized. Run: overlay-cli setup');
   
-  const identity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
+  let identity;
+  try {
+    identity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
+  } catch (err) {
+    return fail(`Failed to read wallet identity: ${err.message}`);
+  }
   const privKey = PrivateKey.fromHex(identity.rootKeyHex);
   const identityKey = identity.identityKey;
   
@@ -2077,7 +2082,10 @@ async function cmdXVerifyComplete(tweetUrl) {
     if (fs.existsSync(verificationsPath)) {
       verifications = JSON.parse(fs.readFileSync(verificationsPath, 'utf-8'));
     }
-  } catch {}
+  } catch (err) {
+    // File corrupt or unreadable - start fresh (existing verifications lost)
+    console.warn(`[x-verify] Warning: Could not read existing verifications: ${err.message}`);
+  }
   
   verifications.push({
     ...verificationPayload,
@@ -2111,7 +2119,9 @@ async function cmdXVerifications() {
     if (fs.existsSync(verificationsPath)) {
       verifications = JSON.parse(fs.readFileSync(verificationsPath, 'utf-8'));
     }
-  } catch {}
+  } catch (err) {
+    console.warn(`[x-verifications] Warning: Could not read verifications file: ${err.message}`);
+  }
   
   ok({ verifications, count: verifications.length });
 }
@@ -4582,7 +4592,9 @@ async function processXEngagement(msg, identityKey, privKey) {
     if (fs.existsSync(verificationsPath)) {
       verifications = JSON.parse(fs.readFileSync(verificationsPath, 'utf-8'));
     }
-  } catch {}
+  } catch (err) {
+    console.warn(`[x-engagement] Warning: Could not read verifications: ${err.message}`);
+  }
   
   if (verifications.length === 0) {
     const rejectPayload = {
@@ -4703,45 +4715,47 @@ async function processXEngagement(msg, identityKey, privKey) {
   let engagementResult;
   
   try {
-    const { execSync } = await import('child_process');
+    const { spawnSync } = await import('child_process');
     
-    // Build bird command with auth from environment or config
-    const birdEnv = { ...process.env };
-    
-    // Escape shell arguments safely
-    const shellEscape = (str) => `'${str.replace(/'/g, "'\\''")}'`;
-    
-    let birdCmd;
+    // Build bird command args (using array syntax for shell safety - no injection risk)
+    let birdArgs = [];
     let resultData = {};
     
     if (action === 'tweet') {
-      birdCmd = `bird tweet ${shellEscape(text)}`;
+      birdArgs = ['tweet', text];
       resultData = { action: 'tweet', text };
     } else if (action === 'reply') {
-      birdCmd = `bird reply ${shellEscape(tweetUrl)} ${shellEscape(text)}`;
+      birdArgs = ['reply', tweetUrl, text];
       resultData = { action: 'reply', tweetUrl, text };
     } else if (action === 'follow') {
       const cleanUsername = username.replace(/^@/, '');
-      birdCmd = `bird follow ${shellEscape(cleanUsername)}`;
+      birdArgs = ['follow', cleanUsername];
       resultData = { action: 'follow', username: cleanUsername };
     } else if (action === 'unfollow') {
       const cleanUsername = username.replace(/^@/, '');
-      birdCmd = `bird unfollow ${shellEscape(cleanUsername)}`;
+      birdArgs = ['unfollow', cleanUsername];
       resultData = { action: 'unfollow', username: cleanUsername };
     }
     
-    // Execute bird command
-    const output = execSync(birdCmd, { 
-      encoding: 'utf-8', 
-      env: birdEnv,
+    // Execute bird command using spawnSync with array args (safe from injection)
+    const result = spawnSync('bird', birdArgs, { 
+      encoding: 'utf-8',
       timeout: 30000,
-      stdio: ['pipe', 'pipe', 'pipe'],
+      env: process.env,
     });
+    
+    if (result.error) {
+      throw result.error;
+    }
+    
+    if (result.status !== 0) {
+      throw new Error(result.stderr || `bird exited with code ${result.status}`);
+    }
     
     engagementResult = {
       success: true,
       ...resultData,
-      output: output.trim(),
+      output: (result.stdout || '').trim(),
       providerXAccount: verifications[0]?.xHandle,
     };
     
