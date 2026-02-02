@@ -142,6 +142,49 @@ function stopAutoImport() {
   }
 }
 
+// Auto-enable hooks in Clawdbot config if not already configured.
+// Returns true if config was modified (gateway restart needed to activate).
+function autoEnableHooks(api: any): boolean {
+  try {
+    const configPaths = [
+      path.join(process.env.HOME || '', '.clawdbot', 'clawdbot.json'),
+      path.join(process.env.HOME || '', '.openclaw', 'openclaw.json'),
+    ];
+
+    for (const configPath of configPaths) {
+      if (!fs.existsSync(configPath)) continue;
+
+      const raw = fs.readFileSync(configPath, 'utf-8');
+      const config = JSON.parse(raw);
+
+      // Check if hooks are already enabled with a token
+      if (config?.hooks?.enabled && config?.hooks?.token) {
+        api?.log?.debug?.('[bsv-overlay] Hooks already configured.');
+        return false;
+      }
+
+      // Generate a random token
+      const tokenBytes = new Uint8Array(24);
+      for (let i = 0; i < 24; i++) tokenBytes[i] = Math.floor(Math.random() * 256);
+      const token = Array.from(tokenBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+
+      // Merge hooks config — preserve existing hooks.internal etc.
+      config.hooks = {
+        ...config.hooks,
+        enabled: true,
+        token: config.hooks?.token || token,
+      };
+
+      fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+      api?.log?.info?.(`[bsv-overlay] Auto-enabled hooks in config (${configPath}). Gateway restart needed to activate.`);
+      return true;
+    }
+  } catch (err: any) {
+    api?.log?.warn?.(`[bsv-overlay] Failed to auto-enable hooks: ${err.message}`);
+  }
+  return false;
+}
+
 // Discover the gateway HTTP port from environment
 function getGatewayPort(): string {
   return process.env.CLAWDBOT_GATEWAY_PORT || process.env.OPENCLAW_GATEWAY_PORT || '18789';
@@ -630,7 +673,9 @@ export default function register(api) {
       });
   }, { commands: ["overlay"] });
 
-  // Auto-setup + auto-register on startup (best-effort, non-fatal, fire-and-forget)
+  // ---------------------------------------------------------------------------
+  // Auto-setup + onboarding (best-effort, non-fatal, fire-and-forget)
+  // ---------------------------------------------------------------------------
   (async () => {
     try {
       const config = pluginConfig;
@@ -639,33 +684,74 @@ export default function register(api) {
       const env = buildEnvironment(config || {});
       const cliPath = path.join(__dirname, 'scripts', 'overlay-cli.mjs');
 
+      // Step 0: Auto-enable hooks if not configured
+      // The plugin needs hooks.enabled + hooks.token for async wake-ups via /hooks/agent
+      const hooksAutoConfigured = autoEnableHooks(api);
+
       // Step 1: Create wallet if missing
+      let walletJustCreated = false;
       if (!fs.existsSync(identityFile)) {
         api.log?.info?.('[bsv-overlay] No wallet found — running auto-setup...');
         await execFileAsync('node', [cliPath, 'setup'], { env });
         api.log?.info?.('[bsv-overlay] Wallet initialized.');
+        walletJustCreated = true;
       }
 
-      // Step 2: Auto-register if wallet exists, has balance, and not yet registered
+      // Step 2: Get wallet address for onboarding message
+      let walletAddress = '';
+      try {
+        const addrResult = await execFileAsync('node', [cliPath, 'address'], { env });
+        const addrOutput = parseCliOutput(addrResult.stdout);
+        walletAddress = addrOutput?.data?.address || '';
+      } catch {}
+
+      // Step 3: Check registration and balance state
       const regPath = path.join(process.env.HOME || '', '.clawdbot', 'bsv-overlay', 'registration.json');
-      if (fs.existsSync(identityFile) && !fs.existsSync(regPath)) {
+      const isRegistered = fs.existsSync(regPath);
+      let balance = 0;
+      try {
         const balResult = await execFileAsync('node', [cliPath, 'balance'], { env });
         const balOutput = parseCliOutput(balResult.stdout);
-        const balance = balOutput?.data?.walletBalance || 0;
-        if (balance >= 1000) {
-          api.log?.info?.('[bsv-overlay] Wallet funded but not registered — auto-registering...');
-          const regResult = await execFileAsync('node', [cliPath, 'register'], { env, timeout: 60000 });
-          const regOutput = parseCliOutput(regResult.stdout);
-          if (regOutput.success) {
-            api.log?.info?.('[bsv-overlay] Auto-registered on overlay network! Waking agent for service selection...');
-            // Wake the agent to present service selection to the user
-            const wakeText = `🎉 BSV Overlay: Auto-registered on the network! Two things to set up:\n\n1. **Agent name**: Ask the user what name they want for their agent on the network. The current default is "${env.AGENT_NAME}". If they want a different name, they need to set it in the plugin config (agentName) and re-register.\n\n2. **Services**: Ask the user which services they want to advertise. Call overlay({ action: "register" }) to get the full list of available services with descriptions and suggested prices, then present them to the user. Let them choose which ones to enable. For each selected service, call overlay({ action: "advertise", serviceId: "...", name: "...", description: "...", priceSats: N }).`;
-            wakeAgent(wakeText, api.log);
-          }
+        balance = balOutput?.data?.walletBalance || 0;
+      } catch {}
+
+      // Step 4: If funded and not registered → auto-register
+      if (!isRegistered && balance >= 1000) {
+        api.log?.info?.('[bsv-overlay] Wallet funded but not registered — auto-registering...');
+        const regResult = await execFileAsync('node', [cliPath, 'register'], { env, timeout: 60000 });
+        const regOutput = parseCliOutput(regResult.stdout);
+        if (regOutput.success) {
+          api.log?.info?.('[bsv-overlay] Auto-registered on overlay network!');
+          const wakeText = `🎉 **BSV Overlay: Registered on the network!**\n\nNotify the user that their agent is now live on the OpenClaw Overlay Network.\n\nNext steps to present to the user:\n1. **Choose an agent name**: Current name is "${env.AGENT_NAME}". To change it, set \`agentName\` in the plugin config and re-register.\n2. **Advertise services**: Ask the user which services they want to offer. Use overlay({ action: "services" }) to see current services, and overlay({ action: "advertise", ... }) to add new ones.\n\nAvailable service types include: code-review, web-research, translate, tell-joke, roulette, and custom services.`;
+          wakeAgent(wakeText, api.log);
+          return; // Registered — done with onboarding
         }
       }
+
+      // Step 5: If already registered, nothing to onboard
+      if (isRegistered) return;
+
+      // Step 6: Not registered + not funded → send onboarding message
+      // This runs on first startup after plugin install (wallet just created or exists but empty)
+      const needsRestart = hooksAutoConfigured;
+      let onboardingMsg = `🔌 **BSV Overlay Plugin — Setup**\n\nThe OpenClaw Overlay Network plugin is installed and your BSV wallet has been initialized.\n\n`;
+
+      if (needsRestart) {
+        onboardingMsg += `✅ **Hooks auto-configured** — async wake-ups are enabled. A gateway restart is needed to activate them. Run: \`clawdbot daemon restart\` or \`/restart\`\n\n`;
+      }
+
+      onboardingMsg += `**To join the network, your wallet needs funding.**\n\n`;
+      onboardingMsg += `📬 **Wallet address**: \`${walletAddress}\`\n`;
+      onboardingMsg += `💰 **Amount needed**: 1,000–10,000 sats (~$0.05–$0.50)\n\n`;
+      onboardingMsg += `Send BSV from any wallet (HandCash, Centbee, etc.) to the address above. After the transaction confirms (~10 min), import it:\n`;
+      onboardingMsg += `\`overlay({ action: "import", txid: "<your-txid>" })\`\n\n`;
+      onboardingMsg += `Once funded, the plugin will auto-register your agent on the next startup.\n\n`;
+      onboardingMsg += `Present this information clearly to the user and help them through the process.`;
+
+      wakeAgent(onboardingMsg, api.log, { sessionKey: 'hook:bsv-overlay:onboarding' });
+
     } catch (err: any) {
-      api.log?.debug?.('[bsv-overlay] Auto-setup/register skipped:', err.message);
+      api.log?.debug?.('[bsv-overlay] Auto-setup/onboarding skipped:', err.message);
     }
   })();
 }
