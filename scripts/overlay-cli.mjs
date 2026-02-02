@@ -1959,15 +1959,15 @@ async function cmdXVerifyStart(xHandle) {
   const sig = privKey.sign(msgHash);
   const signature = Array.from(sig.toDER()).map(b => b.toString(16).padStart(2, '0')).join('');
   
-  // Generate the tweet text
-  const tweetText = `Verifying my Claw Overlay identity 🪙
+  // Generate the tweet text (must fit in 280 chars)
+  // Format: compact with full key + truncated sig (verifier fetches full sig from pending file)
+  const shortSig = signature.slice(0, 40);
+  const tweetText = `🪙 Claw Overlay Verification
 
-Identity: ${identityKey.slice(0, 16)}...${identityKey.slice(-8)}
-Signature: ${signature.slice(0, 32)}...
-
-Full verification:
 ${identityKey}
-${signature}`;
+${shortSig}...
+
+Verify: clawoverlay.com/verify/${identityKey.slice(-12)}`;
 
   // Save pending verification
   const pendingPath = path.join(OVERLAY_STATE_DIR, 'pending-x-verification.json');
@@ -2024,18 +2024,19 @@ async function cmdXVerifyComplete(tweetUrl) {
     return fail(`Failed to fetch tweet: ${err.message}. Make sure bird CLI is configured.`);
   }
   
-  // Verify the tweet contains our signature
+  // Verify the tweet contains our identity key and partial signature
   const tweetText = tweetData.text || tweetData.full_text || '';
-  if (!tweetText.includes(pending.signature.slice(0, 32))) {
-    return fail('Tweet does not contain the expected verification signature.');
-  }
   if (!tweetText.includes(pending.identityKey)) {
     return fail('Tweet does not contain the expected identity key.');
   }
+  // Check for partial signature (first 40 chars) since tweets are length-limited
+  if (!tweetText.includes(pending.signature.slice(0, 40))) {
+    return fail('Tweet does not contain the expected verification signature prefix.');
+  }
   
   // Get the X user info from the tweet
-  const xUserId = tweetData.user?.id_str || tweetData.author?.id || tweetData.user_id;
-  const xHandle = tweetData.user?.screen_name || tweetData.author?.username || pending.handle.replace('@', '');
+  const xUserId = tweetData.user?.id_str || tweetData.authorId || tweetData.author?.id || tweetData.user_id;
+  const xHandle = tweetData.user?.screen_name || tweetData.author?.username || tweetData.author?.name || pending.handle.replace('@', '');
   
   if (!xUserId) {
     return fail('Could not extract X user ID from tweet data.');
@@ -2057,12 +2058,16 @@ async function cmdXVerifyComplete(tweetUrl) {
     verifiedAt: new Date().toISOString(),
   };
   
-  // Submit to overlay
-  let result;
+  // Submit to overlay (may fail if topic manager not deployed yet)
+  let result = { txid: null, funded: 'pending-server-support' };
+  let onChainStored = false;
   try {
     result = await buildRealOverlayTransaction(verificationPayload, TOPICS.X_VERIFICATION);
+    onChainStored = true;
   } catch (err) {
-    return fail(`Failed to store verification on-chain: ${err.message}`);
+    // Topic manager may not be deployed yet - store locally and warn
+    console.error(`[x-verify] On-chain storage failed (server may not support topic yet): ${err.message}`);
+    console.error('[x-verify] Storing verification locally. On-chain anchoring will be available once topic manager is deployed.');
   }
   
   // Save verification locally
@@ -2091,6 +2096,8 @@ async function cmdXVerifyComplete(tweetUrl) {
     tweetId,
     txid: result.txid,
     funded: result.funded,
+    onChainStored,
+    note: onChainStored ? undefined : 'Stored locally. On-chain anchoring pending server topic manager deployment.',
   });
 }
 
