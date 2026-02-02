@@ -332,12 +332,12 @@ async function buildRealOverlayTransaction(payload, topic) {
     try {
       return await buildFromStoredBeef(payload, topic, storedChange, privKey, pubKey, hash160);
     } catch (storedErr) {
-      // Stored BEEF failed — fall through to WoC
-      console.error(`[buildTx] Stored BEEF failed: ${storedErr.message}`);
+      // Stored BEEF failed — fall through to WoC BEEF / UTXO lookup
+      console.error(`[buildTx] Stored BEEF failed (${storedErr.message}), falling back to WoC BEEF approach...`);
     }
   }
 
-  // === Fallback: WoC UTXO lookup (needs confirmed tx with proof) ===
+  // === Fallback: WoC UTXO lookup (uses WoC BEEF-first, then manual chain-walk) ===
   const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
   const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
   let utxos = [];
@@ -351,6 +351,7 @@ async function buildRealOverlayTransaction(payload, topic) {
     try {
       return await buildRealFundedTx(payload, topic, utxos[0], privKey, pubKey, hash160, walletAddress, wocBase);
     } catch (realErr) {
+      console.error(`[buildTx] WoC funded tx failed (${realErr.message}), trying next fallback...`);
       // Fall through
     }
   }
@@ -458,57 +459,101 @@ async function buildFromStoredBeef(payload, topic, storedChange, privKey, pubKey
   return { txid, beef, steak, funded: 'stored-beef', changeSats };
 }
 
+/**
+ * Fetch a pre-built BEEF from WhatsonChain for a given txid.
+ * WoC returns raw binary BEEF that includes the full source chain and merkle proofs.
+ * This is more reliable than manually walking the chain, especially for unconfirmed
+ * or deep transaction chains.
+ * @param {string} txid - Transaction ID to fetch BEEF for
+ * @returns {Uint8Array|null} Raw BEEF bytes, or null if unavailable
+ */
+async function fetchBeefFromWoC(txid) {
+  try {
+    const resp = await wocFetch(`/tx/${txid}/beef`);
+    if (!resp.ok) return null;
+    // WoC returns BEEF as a hex string (not raw binary)
+    const hexStr = (await resp.text()).trim();
+    if (!hexStr || hexStr.length < 8) return null;
+    const bytes = hexStr.match(/.{2}/g).map(h => parseInt(h, 16));
+    return new Uint8Array(bytes);
+  } catch {
+    return null;
+  }
+}
+
 /** Build a real funded transaction using WoC UTXO */
 async function buildRealFundedTx(payload, topic, utxo, privKey, pubKey, hash160, walletAddress, wocBase) {
-  // Fetch raw source tx
-  const rawResp = await wocFetch(`/tx/${utxo.tx_hash}/hex`);
-  if (!rawResp.ok) throw new Error(`Failed to fetch source tx: ${rawResp.status}`);
-  const rawTxHex = await rawResp.text();
-  const sourceTx = Transaction.fromHex(rawTxHex);
+  let sourceTx = null;
+  let usedWocBeef = false;
+  let wocBeefBytes = null;
 
-  // Fetch merkle proof for the source tx
-  const txInfoResp = await wocFetch(`/tx/${utxo.tx_hash}`);
-  const txInfo = await txInfoResp.json();
-  const blockHeight = txInfo.blockheight;
-
-  // Walk the source chain back to a confirmed tx with merkle proof.
-  // Each unconfirmed tx needs its sourceTransaction linked for BEEF building.
-  const txChain = []; // will contain [sourceTx, ..., provenAncestor] newest-first
-  let curTx = sourceTx;
-  let curTxid = utxo.tx_hash;
-  let curHeight = blockHeight;
-  let curConf = txInfo.confirmations;
-
-  for (let depth = 0; depth < 10; depth++) {
-    if (curHeight && curConf > 0) {
-      // Confirmed tx — attach merkle proof
-      const proofResp = await wocFetch(`/tx/${curTxid}/proof/tsc`);
-      if (proofResp.ok) {
-        const proofData = await proofResp.json();
-        if (Array.isArray(proofData) && proofData.length > 0) {
-          const proof = proofData[0];
-          curTx.merklePath = buildMerklePathFromTSC(curTxid, proof.index, proof.nodes, curHeight);
-        }
+  // === BEEF-first approach: fetch pre-built BEEF from WoC ===
+  // This is more reliable than manually walking the chain, especially for
+  // unconfirmed txs or deep chains that break after gateway restarts.
+  wocBeefBytes = await fetchBeefFromWoC(utxo.tx_hash);
+  if (wocBeefBytes) {
+    try {
+      const srcBeef = Beef.fromBinary(Array.from(wocBeefBytes));
+      // Use findAtomicTransaction to get the tx with full proof tree
+      // (sourceTransaction links + merklePaths populated)
+      const provenTx = srcBeef.findAtomicTransaction(utxo.tx_hash);
+      if (provenTx) {
+        sourceTx = provenTx;
+        usedWocBeef = true;
       }
-      txChain.push(curTx);
-      break; // Found a proven tx, stop walking
+    } catch (beefErr) {
+      console.error(`[buildRealFundedTx] WoC BEEF parse failed for ${utxo.tx_hash}: ${beefErr.message}`);
+      // Fall through to manual chain building
     }
-    // Unconfirmed — walk to its first input's source
-    txChain.push(curTx);
-    const parentTxid = curTx.inputs[0]?.sourceTXID;
-    if (!parentTxid) break;
-    const parentHexResp = await wocFetch(`/tx/${parentTxid}/hex`);
-    if (!parentHexResp.ok) break;
-    const parentTx = Transaction.fromHex(await parentHexResp.text());
-    // Link the child's input to the parent Transaction object
-    curTx.inputs[0].sourceTransaction = parentTx;
-    const parentInfoResp = await wocFetch(`/tx/${parentTxid}`);
-    if (!parentInfoResp.ok) break;
-    const parentInfo = await parentInfoResp.json();
-    curTx = parentTx;
-    curTxid = parentTxid;
-    curHeight = parentInfo.blockheight;
-    curConf = parentInfo.confirmations;
+  }
+
+  // === Fallback: manual chain-walking approach ===
+  if (!sourceTx) {
+    const rawResp = await wocFetch(`/tx/${utxo.tx_hash}/hex`);
+    if (!rawResp.ok) throw new Error(`Failed to fetch source tx: ${rawResp.status}`);
+    const rawTxHex = await rawResp.text();
+    sourceTx = Transaction.fromHex(rawTxHex);
+
+    // Fetch merkle proof for the source tx
+    const txInfoResp = await wocFetch(`/tx/${utxo.tx_hash}`);
+    const txInfo = await txInfoResp.json();
+    const blockHeight = txInfo.blockheight;
+
+    // Walk the source chain back to a confirmed tx with merkle proof.
+    let curTx = sourceTx;
+    let curTxid = utxo.tx_hash;
+    let curHeight = blockHeight;
+    let curConf = txInfo.confirmations;
+
+    for (let depth = 0; depth < 10; depth++) {
+      if (curHeight && curConf > 0) {
+        // Confirmed tx — attach merkle proof
+        const proofResp = await wocFetch(`/tx/${curTxid}/proof/tsc`);
+        if (proofResp.ok) {
+          const proofData = await proofResp.json();
+          if (Array.isArray(proofData) && proofData.length > 0) {
+            const proof = proofData[0];
+            curTx.merklePath = buildMerklePathFromTSC(curTxid, proof.index, proof.nodes, curHeight);
+          }
+        }
+        break; // Found a proven tx, stop walking
+      }
+      // Unconfirmed — walk to its first input's source
+      const parentTxid = curTx.inputs[0]?.sourceTXID;
+      if (!parentTxid) break;
+      const parentHexResp = await wocFetch(`/tx/${parentTxid}/hex`);
+      if (!parentHexResp.ok) break;
+      const parentTx = Transaction.fromHex(await parentHexResp.text());
+      // Link the child's input to the parent Transaction object
+      curTx.inputs[0].sourceTransaction = parentTx;
+      const parentInfoResp = await wocFetch(`/tx/${parentTxid}`);
+      if (!parentInfoResp.ok) break;
+      const parentInfo = await parentInfoResp.json();
+      curTx = parentTx;
+      curTxid = parentTxid;
+      curHeight = parentInfo.blockheight;
+      curConf = parentInfo.confirmations;
+    }
   }
 
   // Build the OP_RETURN transaction
@@ -539,9 +584,17 @@ async function buildRealFundedTx(payload, topic, utxo, privKey, pubKey, hash160,
   await tx.sign();
   const txid = tx.id('hex');
 
-  // Build BEEF — mergeTransaction auto-follows sourceTransaction links
-  const srcTxRef = tx.inputs[0]?.sourceTransaction;
+  // Build BEEF
   const beefObj = new Beef();
+  // If we have a WoC BEEF, merge it first for complete proof chain
+  if (usedWocBeef && wocBeefBytes) {
+    try {
+      beefObj.mergeBeef(Array.from(wocBeefBytes));
+    } catch (mergeErr) {
+      console.error(`[buildRealFundedTx] WoC BEEF merge failed: ${mergeErr.message}`);
+    }
+  }
+  // mergeTransaction follows sourceTransaction links for the full chain
   beefObj.mergeTransaction(tx);
   const beef = beefObj.toBinary();
 
@@ -558,7 +611,7 @@ async function buildRealFundedTx(payload, topic, utxo, privKey, pubKey, hash160,
     }
   }
 
-  return { txid, beef, steak, funded: 'real', changeSats };
+  return { txid, beef, steak, funded: usedWocBeef ? 'real-woc-beef' : 'real', changeSats };
 }
 
 /** Build merkle path from TSC proof data */
@@ -1039,32 +1092,81 @@ async function cmdImport(txidArg, voutStr) {
   if (!txInfoResp.ok) return fail(`Failed to fetch tx info: ${txInfoResp.status}`);
   const txInfo = await txInfoResp.json();
 
-  if (!txInfo.confirmations || txInfo.confirmations < 1) {
-    return fail(`Transaction ${txid} is unconfirmed (${txInfo.confirmations || 0} confirmations). Wait for 1+ confirmation.`);
-  }
+  const isConfirmed = txInfo.confirmations && txInfo.confirmations >= 1;
   const blockHeight = txInfo.blockheight;
 
-  // Fetch raw tx
-  const rawTxResp = await wocFetch(`/tx/${txid}/hex`);
-  if (!rawTxResp.ok) return fail(`Failed to fetch raw tx: ${rawTxResp.status}`);
-  const rawTxHex = await rawTxResp.text();
-  const sourceTx = Transaction.fromHex(rawTxHex);
-  const output = sourceTx.outputs[vout];
-  if (!output) return fail(`Output index ${vout} not found (tx has ${sourceTx.outputs.length} outputs)`);
+  let atomicBeefBytes;
 
-  // Fetch TSC merkle proof
-  const proofResp = await wocFetch(`/tx/${txid}/proof/tsc`);
-  if (!proofResp.ok) return fail(`Failed to fetch merkle proof: ${proofResp.status}`);
-  const proofData = await proofResp.json();
-  if (!Array.isArray(proofData) || proofData.length === 0) return fail('No merkle proof available');
+  if (isConfirmed) {
+    // === Confirmed path: use merkle proof (existing approach) ===
+    // Fetch raw tx
+    const rawTxResp = await wocFetch(`/tx/${txid}/hex`);
+    if (!rawTxResp.ok) return fail(`Failed to fetch raw tx: ${rawTxResp.status}`);
+    const rawTxHex = await rawTxResp.text();
+    const sourceTx = Transaction.fromHex(rawTxHex);
+    const output = sourceTx.outputs[vout];
+    if (!output) return fail(`Output index ${vout} not found (tx has ${sourceTx.outputs.length} outputs)`);
 
-  const proof = proofData[0];
-  const merklePath = buildMerklePathFromTSC(txid, proof.index, proof.nodes, blockHeight);
-  sourceTx.merklePath = merklePath;
+    // Try WoC BEEF first (even for confirmed — it's more reliable)
+    let usedWocBeef = false;
+    const wocBeefBytes = await fetchBeefFromWoC(txid);
+    if (wocBeefBytes) {
+      try {
+        const wocBeef = Beef.fromBinary(Array.from(wocBeefBytes));
+        const foundTx = wocBeef.findTxid(txid);
+        if (foundTx) {
+          atomicBeefBytes = wocBeef.toBinaryAtomic(txid);
+          usedWocBeef = true;
+        }
+      } catch (beefErr) {
+        console.error(`[cmdImport] WoC BEEF parse failed for confirmed tx: ${beefErr.message}`);
+      }
+    }
 
-  const beef = new Beef();
-  beef.mergeTransaction(sourceTx);
-  const atomicBeefBytes = beef.toBinaryAtomic(txid);
+    // Fallback: manual TSC proof
+    if (!usedWocBeef) {
+      const proofResp = await wocFetch(`/tx/${txid}/proof/tsc`);
+      if (!proofResp.ok) return fail(`Failed to fetch merkle proof: ${proofResp.status}`);
+      const proofData = await proofResp.json();
+      if (!Array.isArray(proofData) || proofData.length === 0) return fail('No merkle proof available');
+
+      const proof = proofData[0];
+      const merklePath = buildMerklePathFromTSC(txid, proof.index, proof.nodes, blockHeight);
+      sourceTx.merklePath = merklePath;
+
+      const beef = new Beef();
+      beef.mergeTransaction(sourceTx);
+      atomicBeefBytes = beef.toBinaryAtomic(txid);
+    }
+  } else {
+    // === Unconfirmed path: try WoC BEEF (includes source chain back to confirmed ancestor) ===
+    const wocBeefBytes = await fetchBeefFromWoC(txid);
+    if (wocBeefBytes) {
+      try {
+        const wocBeef = Beef.fromBinary(Array.from(wocBeefBytes));
+        const foundTx = wocBeef.findTxid(txid);
+        if (!foundTx) {
+          return fail(`Transaction ${txid} is unconfirmed and WoC BEEF does not contain it. Wait for 1+ confirmation.`);
+        }
+        // Verify the output exists
+        const txObj = foundTx.tx || foundTx._tx;
+        if (txObj) {
+          const output = txObj.outputs[vout];
+          if (!output) return fail(`Output index ${vout} not found (tx has ${txObj.outputs.length} outputs)`);
+        }
+        atomicBeefBytes = wocBeef.toBinaryAtomic(txid);
+      } catch (beefErr) {
+        return fail(`Transaction ${txid} is unconfirmed (${txInfo.confirmations || 0} confirmations) and WoC BEEF failed: ${beefErr.message}. Wait for 1+ confirmation.`);
+      }
+    } else {
+      return fail(`Transaction ${txid} is unconfirmed (${txInfo.confirmations || 0} confirmations) and no BEEF available from WoC. Wait for 1+ confirmation.`);
+    }
+  }
+
+  // Fetch output satoshis for reporting (may not be available from BEEF path)
+  let outputSatoshis = txInfo.vout?.[vout]?.value != null
+    ? Math.round(txInfo.vout[vout].value * 1e8)
+    : undefined;
 
   // Import into wallet
   const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
@@ -1091,10 +1193,11 @@ async function cmdImport(txidArg, voutStr) {
     const explorerBase = NETWORK === 'mainnet' ? 'https://whatsonchain.com' : 'https://test.whatsonchain.com';
     ok({
       txid, vout,
-      satoshis: output.satoshis,
-      blockHeight,
-      confirmations: txInfo.confirmations,
+      satoshis: outputSatoshis,
+      blockHeight: blockHeight || null,
+      confirmations: txInfo.confirmations || 0,
       imported: true,
+      unconfirmed: !isConfirmed,
       balance,
       explorer: `${explorerBase}/tx/${txid}`,
     });
