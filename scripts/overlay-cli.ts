@@ -35,6 +35,14 @@ import { cmdRequestService } from './lib/services/request.js';
 import { cmdRespondService, cmdResearchRespond } from './lib/services/respond.js';
 import { cmdServiceQueue, cmdResearchQueue } from './lib/services/queue.js';
 
+// PeerPay commands
+import {
+  cmdPeerPayInit,
+  cmdPeerPayLookup,
+  cmdPeerPaySend,
+  cmdPeerPayReceive,
+} from './lib/peerpay/commands.js';
+
 // X verification commands
 import {
   cmdXVerifyStart,
@@ -162,13 +170,28 @@ async function main() {
         await cmdXEngagementFulfill(args[0], args[1]);
         break;
 
+      // PeerPay (BRC-29)
+      case 'peerpay-init':
+        await cmdPeerPayInit(args[0]);
+        break;
+      case 'peerpay-lookup':
+        await cmdPeerPayLookup(args[0]);
+        break;
+      case 'peerpay-send':
+        await cmdPeerPaySend(args[0], args[1]);
+        break;
+      case 'peerpay-receive':
+        await cmdPeerPayReceive();
+        break;
+
       default:
         fail(
           `Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, ` +
             `register, unregister, services, advertise, readvertise, remove, discover, pay, verify, accept, ` +
             `send, inbox, ack, poll, connect, request-service, research-queue, research-respond, ` +
             `service-queue, respond-service, x-verify-start, x-verify-complete, x-verifications, x-lookup, ` +
-            `x-engagement-queue, x-engagement-fulfill`
+            `x-engagement-queue, x-engagement-fulfill, ` +
+            `peerpay-init, peerpay-lookup, peerpay-send, peerpay-receive`
         );
     }
   } catch (err: any) {
