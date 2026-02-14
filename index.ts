@@ -407,7 +407,8 @@ export default function register(api) {
             "setup", "address", "import", "register", "advertise", 
             "readvertise", "remove", "send", "inbox", "services", "refund",
             "onboard", "pending-requests", "fulfill",
-            "unregister", "remove-service"
+            "unregister", "remove-service",
+            "peerpay-send", "peerpay-receive", "peerpay-init", "peerpay-lookup"
           ],
           description: "Action to perform"
         },
@@ -500,9 +501,18 @@ export default function register(api) {
           type: "string",
           description: "Recipient identity key for fulfill"
         },
-        result: {
+result: {
           type: "object",
           description: "Service result for fulfill"
+        },
+        // PeerPay parameters
+        recipientQuery: {
+          type: "string",
+          description: "Recipient handle or identity key for PeerPay"
+        },
+        satoshis: {
+          type: "string",
+          description: "Amount in satoshis for PeerPay send"
         }
       },
       required: ["action"]
@@ -828,6 +838,18 @@ async function executeOverlayAction(params, config, api) {
     case "remove-service":
       return await handleRemoveService(params, env, cliPath);
     
+    case "peerpay-send":
+      return await handlePeerPaySend(params, env, cliPath, config);
+
+    case "peerpay-receive":
+      return await handlePeerPayReceive(env, cliPath);
+
+    case "peerpay-init":
+      return await handlePeerPayInit(params, env, cliPath);
+
+    case "peerpay-lookup":
+      return await handlePeerPayLookup(params, env, cliPath);
+
     default:
       throw new Error(`Unknown action: ${action}`);
   }
@@ -1484,6 +1506,69 @@ async function handleFulfill(params, env, cliPath) {
   return output.data;
 }
 
+async function handlePeerPaySend(params, env, cliPath, config) {
+  const { recipientQuery, satoshis } = params;
+  if (!recipientQuery || !satoshis) {
+    throw new Error("recipientQuery and satoshis are required for peerpay-send");
+  }
+  const walletDir = config?.walletDir || path.join(process.env.HOME || '', '.clawdbot', 'bsv-wallet');
+
+  // Check daily budget
+  const dailyLimit = config?.dailyBudgetSats || 1000;
+  const sats = parseInt(String(satoshis), 10);
+  const budgetCheck = checkBudget(walletDir, sats, dailyLimit);
+  if (!budgetCheck.allowed) {
+    throw new Error(`PeerPay would exceed daily budget. Spent: ${budgetCheck.spent}, Remaining: ${budgetCheck.remaining}, Requested: ${sats} sats.`);
+  }
+
+  // Add MESSAGE_BOX_URL from config
+  if (config?.messageBoxUrl) {
+    env.MESSAGE_BOX_URL = config.messageBoxUrl;
+  }
+
+  const result = await execFileAsync('node', [cliPath, 'peerpay-send', recipientQuery, String(satoshis)], { env, timeout: 60000 });
+  const output = parseCliOutput(result.stdout);
+  if (!output.success) throw new Error(`PeerPay send failed: ${output.error}`);
+
+  recordSpend(walletDir, sats, 'peerpay', recipientQuery);
+  writeActivityEvent({ type: 'peerpay_sent', emoji: '💸', sats, recipient: recipientQuery, message: `PeerPay: sent ${sats} sats to ${recipientQuery}` });
+
+  return output.data;
+}
+
+async function handlePeerPayReceive(env, cliPath) {
+  const result = await execFileAsync('node', [cliPath, 'peerpay-receive'], { env, timeout: 60000 });
+  const output = parseCliOutput(result.stdout);
+  if (!output.success) throw new Error(`PeerPay receive failed: ${output.error}`);
+
+  if (output.data?.accepted > 0) {
+    writeActivityEvent({ type: 'peerpay_received', emoji: '💰', count: output.data.accepted, message: `PeerPay: accepted ${output.data.accepted} incoming payment(s)` });
+  }
+
+  return output.data;
+}
+
+async function handlePeerPayInit(params, env, cliPath) {
+  const { messageBoxUrl } = params;
+  const args = [cliPath, 'peerpay-init'];
+  if (messageBoxUrl) args.push(messageBoxUrl);
+
+  const result = await execFileAsync('node', args, { env, timeout: 60000 });
+  const output = parseCliOutput(result.stdout);
+  if (!output.success) throw new Error(`PeerPay init failed: ${output.error}`);
+  return output.data;
+}
+
+async function handlePeerPayLookup(params, env, cliPath) {
+  const { recipientQuery } = params;
+  if (!recipientQuery) throw new Error("recipientQuery is required for peerpay-lookup");
+
+  const result = await execFileAsync('node', [cliPath, 'peerpay-lookup', recipientQuery], { env, timeout: 30000 });
+  const output = parseCliOutput(result.stdout);
+  if (!output.success) throw new Error(`PeerPay lookup failed: ${output.error}`);
+  return output.data;
+}
+
 function buildEnvironment(config) {
   const env = { ...process.env };
   
@@ -1507,6 +1592,9 @@ function buildEnvironment(config) {
     env.AGENT_DESCRIPTION = config.agentDescription;
   }
   env.AGENT_ROUTED = 'true'; // Route service requests through the agent
+  if (config.messageBoxUrl) {
+    env.MESSAGE_BOX_URL = config.messageBoxUrl;
+  }
   
   return env;
 }
