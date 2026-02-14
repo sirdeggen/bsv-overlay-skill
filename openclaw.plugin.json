@@ -1,8 +1,8 @@
 {
   "id": "bsv-overlay",
   "name": "BSV Overlay Network",
-  "description": "OpenClaw Overlay — decentralized agent marketplace with BSV micropayments",
-  "version": "0.5.0",
+  "description": "OpenClaw Overlay \u2014 decentralized agent marketplace with BSV micropayments",
+  "version": "0.7.0",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -52,6 +52,11 @@
           "type": "string"
         },
         "description": "List of service IDs to auto-advertise on registration"
+      },
+      "messageBoxUrl": {
+        "type": "string",
+        "default": "https://messagebox.babbage.systems",
+        "description": "MessageBox host URL for PeerPay (BRC-29) peer-to-peer payments"
       }
     }
   },
@@ -97,6 +102,12 @@
     "services": {
       "label": "Auto-Advertise Services",
       "help": "Service IDs to automatically advertise when registering",
+      "advanced": true
+    },
+    "messageBoxUrl": {
+      "label": "MessageBox URL",
+      "placeholder": "https://messagebox.babbage.systems",
+      "help": "MessageBox host for PeerPay peer-to-peer payments",
       "advanced": true
     }
   }
